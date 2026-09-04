@@ -1,15 +1,15 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
-use std::os::unix::io::OwnedFd;
+use std::os::unix::io::{AsFd, FromRawFd, OwnedFd};
 
 use ash::vk;
 use ash::{Entry, Instance};
 use drm_fourcc::DrmFourcc;
-use wayland_client::backend::{Backend, ObjectId};
-use wayland_client::protocol::{wl_compositor, wl_registry, wl_surface};
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::backend::ObjectId;
+use wayland_client::protocol::{wl_buffer, wl_compositor, wl_registry, wl_surface};
+use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
@@ -127,17 +127,20 @@ struct State {
     modifiers_printed: bool,
     // Current window size in surface coordinates.
     size: (u32, u32),
-    // Vulkan renderer, initialized once the surface + size are known.
+    // Vulkan renderer, initialized once the size is known.
     vk: Option<Vulkan>,
-    // Raw pointers handed to the Vulkan wayland surface. Kept alive here so the
-    // borrow checker sees they outlive the swapchain.
-    _surface_ptr: Option<*mut vk::wl_surface>,
-    _display_ptr: Option<*mut vk::wl_display>,
+    // Queue handle used to create wayland buffer objects at present time.
+    qh: Option<QueueHandle<Self>>,
+    // Set while a zwp_linux_buffer_params create is awaiting its "created"
+    // event, so we don't spam the compositor with overlapping creations.
+    params_pending: bool,
+    // Size (in pixels) of the buffer currently being created, for attach.
+    create_size: Option<(i32, i32)>,
 }
 
 impl State {
     /// Create the surface + xdg toplevel once all needed globals are bound.
-    fn init_window(&mut self, qh: &QueueHandle<Self>, display_ptr: *mut vk::wl_display) {
+    fn init_window(&mut self, qh: &QueueHandle<Self>) {
         if self.surface.is_some() {
             return;
         }
@@ -163,34 +166,33 @@ impl State {
         self.xdg_surface = Some(xdg_surface);
         self.toplevel = Some(toplevel);
         self.decoration = decoration;
-        self._display_ptr = Some(display_ptr);
 
-        // The Vulkan WSI will attach + commit dmabufs for us, but we still do an
-        // initial commit so the shell configures the window.
+        // Initial commit so the shell configures the window.
         surface.commit();
     }
 
-    /// Lazily (re)create the swapchain and render a cleared frame.
+    /// Lazily (re)create a drm-backed buffer, render a cleared frame into it,
+    /// and hand the exported dmabuf to the compositor as a wl_buffer.
     fn render(&mut self, width: u32, height: u32) {
-        let (Some(surface), Some(display_ptr)) = (&self.surface, &self._display_ptr) else {
+        // Skip presenting while a previous buffer creation is still in flight.
+        if self.params_pending {
             return;
-        };
+        }
 
         // Initialise the Vulkan renderer on first render.
         if self.vk.is_none() {
-            let surface_ptr = surface.id().as_ptr() as *mut vk::wl_surface;
-            self._surface_ptr = Some(surface_ptr);
-            let display_ptr = *display_ptr;
             let main_device = self.main_device.unwrap();
-            match Vulkan::new(display_ptr, surface_ptr, main_device) {
-                Ok(vk) => {
+            match Vulkan::new(main_device) {
+                Ok(mut vk) => {
                     // Once, when both the feedback tranches and the Vulkan
-                    // device are available: compute and print the intersection.
+                    // device are available: compute and print the intersection,
+                    // then pick the format/modifier for the buffer.
                     if !self.modifiers_printed && !self.dmabuf_formats.is_empty() {
                         vk.compute_intersection(&mut self.dmabuf_formats);
                         vk.print_formats(&self.dmabuf_formats);
                         self.modifiers_printed = true;
                     }
+                    vk.set_buffer_format(&self.dmabuf_formats);
                     self.vk = Some(vk);
                 }
                 Err(e) => {
@@ -200,10 +202,40 @@ impl State {
             }
         }
 
+        let (Some(dmabuf), Some(qh)) = (&self.dmabuf.clone(), self.qh.clone()) else {
+            return;
+        };
+
         let vk = self.vk.as_mut().unwrap();
-        if let Err(e) = vk.present(width, height) {
-            eprintln!("vulkan present failed: {e}");
+        let presented = match vk.present(width, height) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("vulkan present failed: {e}");
+                return;
+            }
+        };
+
+        // Wrap the exported dmabuf into a wl_buffer via linux-dmabuf params.
+        let params = dmabuf.create_params(&qh, AppData);
+        for (idx, plane) in presented.planes.iter().enumerate() {
+            params.add(
+                presented.fd.as_fd(),
+                idx as u32,
+                plane.offset as u32,
+                plane.stride as u32,
+                (presented.modifier >> 32) as u32,
+                (presented.modifier & 0xffff_ffff) as u32,
+            );
         }
+        params.create(
+            presented.width,
+            presented.height,
+            presented.format_fourcc,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+        );
+
+        self.params_pending = true;
+        self.create_size = Some((presented.width, presented.height));
     }
 
     /// Record a (format, modifier) pair from a feedback tranche, preserving the
@@ -226,83 +258,94 @@ impl State {
 
 // --------------------------- Ash rendering ------------------------------
 
+/// The per-plane layout (offset + stride) of an exported dmabuf, as reported
+/// by vkGetImageSubresourceLayout.
+#[derive(Clone, Copy)]
+struct DmaPlane {
+    offset: u64,
+    stride: u64,
+}
+
+/// A frame's worth of GPU work: one command buffer (reused) and one fence.
+/// We only ever render into a single buffer synchronously per frame.
 struct FrameData {
     command_buffer: vk::CommandBuffer,
-    acquire_semaphore: vk::Semaphore,
-    render_semaphore: vk::Semaphore,
-    // Signalled once this frame's GPU work is done; waited on before reuse.
+    // Signalled once the frame's GPU work is done; waited on before reuse.
     fence: vk::Fence,
+}
+
+/// One Vulkan image exported to the compositor as a DRM dmabuf.
+struct DmaBuffer {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    fd: OwnedFd,
+    planes: Vec<DmaPlane>,
+}
+
+/// A buffer handed to the Wayland layer to wrap in a wl_buffer.
+struct PresentedBuffer {
+    fd: OwnedFd,
+    format_fourcc: u32,
+    modifier: u64,
+    planes: Vec<DmaPlane>,
+    width: i32,
+    height: i32,
 }
 
 struct Vulkan {
     _entry: Entry,
     instance: Instance,
-    surface: vk::SurfaceKHR,
-    surface_fn: ash::khr::surface::Instance,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
-    swapchain: ash::khr::swapchain::Device,
-    swapchain_khr: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
-    format: vk::Format,
+    /// Exported-fd loader for VK_KHR_external_memory_fd.
+    external_fd: ash::khr::external_memory_fd::Device,
+    /// Format and modifier of the current buffer, and its size in pixels.
+    vk_format: vk::Format,
+    drm_format: u32,
+    modifier: u64,
     extent: vk::Extent2D,
     command_pool: vk::CommandPool,
-    // One frame resource set per swapchain image (fence per image).
-    frames: Vec<FrameData>,
-    current_frame: usize,
+    frame: Option<FrameData>,
+    /// The current single buffer, recreated on resize.
+    buffer: Option<DmaBuffer>,
+    /// Chosen (drm fourcc, vk format, modifier), set once from the intersection.
+    buffer_fmt: Option<(u32, vk::Format, u64)>,
 }
 
 impl Vulkan {
-    fn new(
-        display_ptr: *mut vk::wl_display,
-        surface_ptr: *mut vk::wl_surface,
-        main_device: u64,
-    ) -> Result<Self, String> {
+    fn new(main_device: u64) -> Result<Self, String> {
         unsafe {
             let entry = Entry::load().map_err(|e| e.to_string())?;
             let instance = create_instance(&entry)?;
 
-            let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
-            let wayland_surface_fn =
-                ash::khr::wayland_surface::Instance::new(&entry, &instance);
-
-            let surface_create_info = vk::WaylandSurfaceCreateInfoKHR::default()
-                .display(display_ptr)
-                .surface(surface_ptr);
-            let surface = wayland_surface_fn
-                .create_wayland_surface(&surface_create_info, None)
-                .map_err(|e| format!("create wayland surface: {e}"))?;
-
             let (physical_device, queue_family) =
-                pick_physical_device(&instance, &surface_fn, surface, main_device)?;
+                pick_physical_device(&instance, main_device)?;
 
-            // Find a queue family that supports both graphics and presentation.
+            // Pick the first queue family that supports graphics.
             let device = create_device(&instance, physical_device, queue_family)?;
             let queue = device.get_device_queue(queue_family, 0);
 
-            let swapchain = ash::khr::swapchain::Device::new(&instance, &device);
+            let external_fd =
+                ash::khr::external_memory_fd::Device::new(&instance, &device);
 
             Ok(Self {
                 _entry: entry,
                 instance,
-                surface,
-                surface_fn,
                 physical_device,
                 device,
                 queue,
                 queue_family,
-                swapchain,
-                swapchain_khr: vk::SwapchainKHR::null(),
-                images: Vec::new(),
-                image_views: Vec::new(),
-                format: vk::Format::UNDEFINED,
+                external_fd,
+                vk_format: vk::Format::UNDEFINED,
+                drm_format: 0,
+                modifier: 0,
                 extent: vk::Extent2D::default(),
                 command_pool: vk::CommandPool::null(),
-                frames: Vec::new(),
-                current_frame: 0,
+                frame: None,
+                buffer: None,
+                buffer_fmt: None,
             })
         }
     }
@@ -375,20 +418,53 @@ impl Vulkan {
         }
     }
 
-    /// (Re)create the swapchain at `width`x`height` and present a cleared frame.
-    fn present(&mut self, width: u32, height: u32) -> Result<(), String> {
+    /// Pick a (DRM fourcc, Vulkan format, modifier) tuple from the given
+    /// intersection, preferring a real (non-linear, non-INVALID) modifier.
+    fn set_buffer_format(&mut self, formats: &[DrmFormatInfo]) {
+        const INVALID_MODIFIER: u64 = (1u64 << 56) - 1;
+        for fmt in formats {
+            let vk_format = drm_fourcc_to_vk(fmt.code);
+            if vk_format == vk::Format::UNDEFINED {
+                continue;
+            }
+            let modifier = fmt
+                .available
+                .iter()
+                .map(|m| m.drm_format_modifier)
+                .find(|m| *m != 0 && *m != INVALID_MODIFIER)
+                .unwrap_or(0);
+            if modifier == INVALID_MODIFIER {
+                continue;
+            }
+            self.buffer_fmt = Some((fmt.code as u32, vk_format, modifier));
+            println!("chose format={} modifier={:016x}", fmt.code, modifier);
+            break;
+        }
+    }
+
+    /// Render a cleared frame into the (current) drm-backed buffer and return
+    /// its exported dmabuf for the Wayland layer to wrap in a wl_buffer.
+    fn present(&mut self, width: u32, height: u32) -> Result<PresentedBuffer, String> {
         unsafe {
-            // Recreate if the requested size differs from the current swapchain.
-            if self.swapchain_khr == vk::SwapchainKHR::null()
+            // Recreate the buffer (and format/modifier choice) on first frame or
+            // when the size changes.
+            if self.buffer.is_none()
                 || self.extent.width != width
                 || self.extent.height != height
             {
-                self.create_swapchain(width, height)?;
+                if self.buffer_fmt.is_none() {
+                    return Err("no DRM format chosen".to_string());
+                }
+                let (drm_format, vk_format, modifier) = self.buffer_fmt.unwrap();
+                self.create_buffer(width, height, drm_format, vk_format, modifier)?;
             }
 
-            // Round-robin through the per-image frame resource sets. Wait until
-            // this frame's fence is signalled before reusing its resources.
-            let frame = &self.frames[self.current_frame % self.frames.len()];
+            let frame = self.frame.as_mut().unwrap();
+            let image = self.buffer.as_ref().unwrap().image;
+            let command_buffer = frame.command_buffer;
+
+            // Wait for the previous frame's work so we can reuse the command
+            // buffer and safely rewrite the single buffer.
             self.device
                 .wait_for_fences(
                     std::slice::from_ref(&frame.fence),
@@ -396,19 +472,6 @@ impl Vulkan {
                     u64::MAX,
                 )
                 .map_err(|e| format!("wait for frame fence: {e}"))?;
-
-            let (image_index, _suboptimal) = self
-                .swapchain
-                .acquire_next_image(
-                    self.swapchain_khr,
-                    u64::MAX,
-                    frame.acquire_semaphore,
-                    vk::Fence::null(),
-                )
-                .map_err(|e| format!("acquire next image: {e}"))?;
-
-            let image = self.images[image_index as usize];
-            let command_buffer = frame.command_buffer;
 
             // Record a command buffer that clears the image to CLEAR_COLOR.
             let begin_info = vk::CommandBufferBeginInfo::default();
@@ -453,10 +516,10 @@ impl Vulkan {
                 std::slice::from_ref(&clear_range),
             );
 
-            // TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
-            let to_present = vk::ImageMemoryBarrier::default()
+            // TRANSFER_DST_OPTIMAL -> GENERAL (compositor reads the dmabuf).
+            let to_general = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
@@ -469,201 +532,209 @@ impl Vulkan {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                std::slice::from_ref(&to_present),
+                std::slice::from_ref(&to_general),
             );
 
             self.device
                 .end_command_buffer(command_buffer)
                 .map_err(|e| format!("end command buffer: {e}"))?;
 
-            // Wait for acquire, submit, signal render.
             self.device
                 .reset_fences(std::slice::from_ref(&frame.fence))
                 .map_err(|e| format!("reset fence: {e}"))?;
 
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let submit = vk::SubmitInfo::default()
-                .wait_semaphores(std::slice::from_ref(&frame.acquire_semaphore))
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(std::slice::from_ref(&command_buffer))
-                .signal_semaphores(std::slice::from_ref(&frame.render_semaphore));
+                .command_buffers(std::slice::from_ref(&command_buffer));
             self.device
                 .queue_submit(self.queue, std::slice::from_ref(&submit), frame.fence)
                 .map_err(|e| format!("queue submit: {e}"))?;
 
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&frame.render_semaphore))
-                .swapchains(std::slice::from_ref(&self.swapchain_khr))
-                .image_indices(std::slice::from_ref(&image_index));
-            let result = self.swapchain.queue_present(self.queue, &present);
+            // Wait for the clear to be visible before handing the dmabuf over.
+            self.device
+                .wait_for_fences(std::slice::from_ref(&frame.fence), true, u64::MAX)
+                .map_err(|e| format!("wait for frame fence: {e}"))?;
 
-            self.current_frame += 1;
+            // Hand the consumer a dup of the fd; the buffer keeps its own copy
+            // for reuse on the next frame.
+            let buffer = self.buffer.as_ref().unwrap();
+            let dup_fd = buffer
+                .fd
+                .try_clone()
+                .map_err(|e| format!("dup dmabuf fd: {e}"))?;
 
-            // Out of date only means the swapchain must be recreated next time.
-            match result {
-                Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
-                | Err(vk::Result::SUBOPTIMAL_KHR) => Ok(()),
-                Err(e) => Err(format!("queue present: {e}")),
-            }
+            Ok(PresentedBuffer {
+                fd: dup_fd,
+                format_fourcc: self.drm_format,
+                modifier: self.modifier,
+                planes: buffer.planes.clone(),
+                width: width as i32,
+                height: height as i32,
+            })
         }
     }
 
-    fn create_swapchain(&mut self, width: u32, height: u32) -> Result<(), String> {
+    /// (Re)create the single drm-backed buffer at `width`x`height` using the
+    /// given DRM format (fourcc), Vulkan format and modifier.
+    fn create_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        drm_format: u32,
+        vk_format: vk::Format,
+        modifier: u64,
+    ) -> Result<(), String> {
         unsafe {
-            if self.swapchain_khr != vk::SwapchainKHR::null() {
-                // Ensure the old swapchain (and its present image uses) have fully
-                // settled before destroying it.
+            if let Some(old) = self.buffer.take() {
                 self.device.device_wait_idle().unwrap();
-                self.swapchain.destroy_swapchain(self.swapchain_khr, None);
-                self.swapchain_khr = vk::SwapchainKHR::null();
+                self.device.destroy_image(old.image, None);
+                self.device.free_memory(old.memory, None);
+                // old.fd closes on drop.
             }
-
-            let caps = self
-                .surface_fn
-                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
-                .map_err(|e| format!("surface capabilities: {e}"))?;
-
-            let formats = self
-                .surface_fn
-                .get_physical_device_surface_formats(self.physical_device, self.surface)
-                .map_err(|e| format!("surface formats: {e}"))?;
-
-            // Prefer the most common colour format.
-            let format = formats
-                .iter()
-                .find(|f| f.format == vk::Format::B8G8R8A8_UNORM && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
-                .or_else(|| formats.first())
-                .ok_or("no surface formats")?;
-            let format = format.format;
-
-            let present_modes = self
-                .surface_fn
-                .get_physical_device_surface_present_modes(self.physical_device, self.surface)
-                .map_err(|e| format!("present modes: {e}"))?;
-            let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
-                vk::PresentModeKHR::MAILBOX
-            } else {
-                vk::PresentModeKHR::FIFO
-            };
 
             let extent = vk::Extent2D {
-                width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-                height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+                width,
+                height,
             };
+            let modifier_list = [modifier];
+            let mut external = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let mut drm_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+                .drm_format_modifiers(&modifier_list);
 
-            let mut image_count = caps.min_image_count + 1;
-            if caps.max_image_count > 0 && image_count > caps.max_image_count {
-                image_count = caps.max_image_count;
-            }
+            let create_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk_format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut external)
+                .push_next(&mut drm_info);
 
-            let create_info = vk::SwapchainCreateInfoKHR::default()
-                .surface(self.surface)
-                .min_image_count(image_count)
-                .image_format(format)
-                .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
-                .image_extent(extent)
-                .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .pre_transform(caps.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(present_mode)
-                .clipped(true);
+            let image = self
+                .device
+                .create_image(&create_info, None)
+                .map_err(|e| format!("create drm image: {e}"))?;
 
-            self.swapchain_khr = self
-                .swapchain
-                .create_swapchain(&create_info, None)
-                .map_err(|e| format!("create swapchain: {e}"))?;
-            self.format = format;
+            // Allocate dedicated, external-exportable memory for the image.
+            let memreq = self.device.get_image_memory_requirements(image);
+            let memory_type_index =
+                self.pick_exportable_memory_type(memreq)
+                    .ok_or("no exportable device-local memory type")?;
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let mut export_info = vk::ExportMemoryAllocateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(memreq.size)
+                .memory_type_index(memory_type_index)
+                .push_next(&mut dedicated)
+                .push_next(&mut export_info);
+            let memory = self
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| format!("allocate external memory: {e}"))?;
+            self.device
+                .bind_image_memory(image, memory, 0)
+                .map_err(|e| format!("bind image memory: {e}"))?;
+
+            // Export the dmabuf fd.
+            let get_fd = vk::MemoryGetFdInfoKHR::default()
+                .memory(memory)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let fd = self
+                .external_fd
+                .get_memory_fd(&get_fd)
+                .map_err(|e| format!("export dmabuf fd: {e}"))?;
+            let fd = OwnedFd::from_raw_fd(fd);
+
+            // Query the per-plane (here: single-plane) memory layout. DRM
+            // modifier images use per-memory-plane aspects.
+            let subresource = vk::ImageSubresource::default()
+                .aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT)
+                .mip_level(0)
+                .array_layer(0);
+            let layout = self.device.get_image_subresource_layout(image, subresource);
+            let planes = vec![DmaPlane {
+                offset: layout.offset,
+                stride: layout.row_pitch,
+            }];
+
+            self.buffer = Some(DmaBuffer {
+                image,
+                memory,
+                fd,
+                planes,
+            });
+            self.vk_format = vk_format;
+            self.drm_format = drm_format;
+            self.modifier = modifier;
+            self.buffer_fmt = Some((drm_format, vk_format, modifier));
             self.extent = extent;
-            self.images = self
-                .swapchain
-                .get_swapchain_images(self.swapchain_khr)
-                .map_err(|e| format!("get swapchain images: {e}"))?;
 
-            // Recreate image views.
-            for view in self.image_views.drain(..) {
-                self.device.destroy_image_view(view, None);
-            }
-            for &image in &self.images {
-                let view_info = vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    );
-                let view = self
-                    .device
-                    .create_image_view(&view_info, None)
-                    .map_err(|e| format!("create image view: {e}"))?;
-                self.image_views.push(view);
-            }
-
-            // Allocate one frame resource set (command buffer, acquire/render
-            // semaphores, fence) per swapchain image.
-            let frame_count = self.images.len();
-            if self.command_pool == vk::CommandPool::null() {
-                let pool_info = vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(self.queue_family)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-                self.command_pool = self
-                    .device
-                    .create_command_pool(&pool_info, None)
-                    .map_err(|e| format!("create command pool: {e}"))?;
-            }
-
-            // Recreate frame resources if the image count changed.
-            if self.frames.len() != frame_count {
-                self.destroy_frames();
-                let sem_info = vk::SemaphoreCreateInfo::default();
-                let fence_info = vk::FenceCreateInfo::default()
-                    .flags(vk::FenceCreateFlags::SIGNALED);
+            // Set up the (single) frame command buffer + fence on first use.
+            if self.frame.is_none() {
+                if self.command_pool == vk::CommandPool::null() {
+                    let pool_info = vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(self.queue_family)
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                    self.command_pool = self
+                        .device
+                        .create_command_pool(&pool_info, None)
+                        .map_err(|e| format!("create command pool: {e}"))?;
+                }
                 let alloc_info = vk::CommandBufferAllocateInfo::default()
                     .command_pool(self.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(frame_count as u32);
+                    .command_buffer_count(1);
                 let bufs = self
                     .device
                     .allocate_command_buffers(&alloc_info)
-                    .map_err(|e| format!("allocate command buffers: {e}"))?;
-                for &cb in &bufs {
-                    let acquire = self
-                        .device
-                        .create_semaphore(&sem_info, None)
-                        .map_err(|e| format!("create acquire semaphore: {e}"))?;
-                    let render = self
-                        .device
-                        .create_semaphore(&sem_info, None)
-                        .map_err(|e| format!("create render semaphore: {e}"))?;
-                    let fence = self
-                        .device
-                        .create_fence(&fence_info, None)
-                        .map_err(|e| format!("create frame fence: {e}"))?;
-                    self.frames.push(FrameData {
-                        command_buffer: cb,
-                        acquire_semaphore: acquire,
-                        render_semaphore: render,
-                        fence,
-                    });
-                }
+                    .map_err(|e| format!("allocate command buffer: {e}"))?;
+                let fence_info = vk::FenceCreateInfo::default()
+                    .flags(vk::FenceCreateFlags::SIGNALED);
+                let fence = self
+                    .device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| format!("create frame fence: {e}"))?;
+                self.frame = Some(FrameData {
+                    command_buffer: bufs[0],
+                    fence,
+                });
             }
 
             Ok(())
         }
     }
 
-    fn destroy_frames(&mut self) {
+    /// A memory type that is device-local and included in `req.memory_type_bits`.
+    fn pick_exportable_memory_type(&self, req: vk::MemoryRequirements) -> Option<u32> {
         unsafe {
-            if self.command_pool == vk::CommandPool::null() {
-                return;
+            let props = self
+                .instance
+                .get_physical_device_memory_properties(self.physical_device);
+            for i in 0..props.memory_type_count as usize {
+                if (req.memory_type_bits & (1 << i)) != 0 {
+                    let mt = props.memory_types[i];
+                    if mt.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                        return Some(i as u32);
+                    }
+                }
             }
-            for frame in self.frames.drain(..) {
-                self.device.destroy_semaphore(frame.acquire_semaphore, None);
-                self.device.destroy_semaphore(frame.render_semaphore, None);
+            None
+        }
+    }
+
+    fn destroy_frame(&mut self) {
+        unsafe {
+            if let Some(frame) = self.frame.take() {
                 self.device.destroy_fence(frame.fence, None);
             }
         }
@@ -673,22 +744,19 @@ impl Vulkan {
 impl Drop for Vulkan {
     fn drop(&mut self) {
         unsafe {
-            // Ensure all in-flight presentation/rendering has completed before
-            // destroying the swapchain or the device.
+            // Ensure all in-flight rendering has completed before destroying.
             self.device.device_wait_idle().unwrap();
 
-            if self.swapchain_khr != vk::SwapchainKHR::null() {
-                self.swapchain.destroy_swapchain(self.swapchain_khr, None);
+            self.destroy_frame();
+            if let Some(buffer) = self.buffer.take() {
+                self.device.destroy_image(buffer.image, None);
+                self.device.free_memory(buffer.memory, None);
+                // buffer.fd closes on drop.
             }
-            for &view in &self.image_views {
-                self.device.destroy_image_view(view, None);
-            }
-            self.destroy_frames();
             if self.command_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.command_pool, None);
             }
             self.device.destroy_device(None);
-            self.surface_fn.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
     }
@@ -705,14 +773,9 @@ fn create_instance(entry: &Entry) -> Result<Instance, String> {
             .engine_name(&engine_name)
             .engine_version(1);
 
-        let extension_names = [
-            ash::khr::surface::NAME.as_ptr(),
-            ash::khr::wayland_surface::NAME.as_ptr(),
-        ];
-
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
-            .enabled_extension_names(&extension_names);
+            .enabled_extension_names(&[]);
 
         entry
             .create_instance(&create_info, None)
@@ -722,8 +785,6 @@ fn create_instance(entry: &Entry) -> Result<Instance, String> {
 
 fn pick_physical_device(
     instance: &Instance,
-    surface_fn: &ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
     dev: u64,
 ) -> Result<(vk::PhysicalDevice, u32), String> {
     let (major, minor) = (major(dev), minor(dev));
@@ -733,11 +794,10 @@ fn pick_physical_device(
             .map_err(|e| format!("enumerate physical devices: {e}"))?;
 
         for device in &devices {
-            let (q, name) =
-                match find_queue_family(instance, surface_fn, surface, *device) {
-                    Some(x) => x,
-                    None => continue,
-                };
+            let (q, name) = match find_queue_family(instance, *device) {
+                Some(x) => x,
+                None => continue,
+            };
             if device_drm_matches(instance, *device, major, minor) {
                 eprintln!("using main GPU: {name}");
                 return Ok((*device, q));
@@ -748,11 +808,9 @@ fn pick_physical_device(
     }
 }
 
-/// Return the queue family index that supports both graphics and present, if any.
+/// Return the first queue family index that supports graphics, if any.
 fn find_queue_family(
     instance: &Instance,
-    surface_fn: &ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
     device: vk::PhysicalDevice,
 ) -> Option<(u32, String)> {
     unsafe {
@@ -760,11 +818,7 @@ fn find_queue_family(
         let name = cstr_to_string(props.device_name.as_ptr());
         let queue_families = instance.get_physical_device_queue_family_properties(device);
         for (i, qf) in queue_families.iter().enumerate() {
-            let supports_graphics = qf.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-            let supports_present = surface_fn
-                .get_physical_device_surface_support(device, i as u32, surface)
-                .unwrap_or(false);
-            if supports_graphics && supports_present {
+            if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
                 return Some((i as u32, name));
             }
         }
@@ -802,7 +856,8 @@ fn create_device(
             .queue_priorities(&priority);
 
         let device_extensions = [
-            ash::khr::swapchain::NAME.as_ptr(),
+            ash::khr::external_memory_fd::NAME.as_ptr(),
+            ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr(),
         ];
 
@@ -864,11 +919,17 @@ impl Dispatch<wl_registry::WlRegistry, GlobalData> for State {
         _conn: &Connection,
         qh: &QueueHandle<State>,
     ) {
-        if let wl_registry::Event::Global { name, interface, .. } = event {
+        if let wl_registry::Event::Global { name, interface, version, .. } = event {
             match interface.as_str() {
                 "wl_compositor" => {
-                    let proxy =
-                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, AppData);
+                    // Version 4 is required so surfaces can use damage_buffer.
+                    let version_used = version.min(4);
+                    let proxy = registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version_used,
+                        qh,
+                        AppData,
+                    );
                     state.compositor = Some(proxy);
                 }
                 "xdg_wm_base" => {
@@ -1003,6 +1064,58 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, AppData> f
     }
 }
 
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, AppData> for State {
+    fn event(
+        state: &mut Self,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _data: &AppData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            // Buffer creation succeeded: attach it to the surface and commit.
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => {
+                params.destroy();
+                if let Some(surface) = &state.surface {
+                    surface.attach(Some(&buffer), 0, 0);
+                    let (w, h) = state.create_size.unwrap_or((0, 0));
+                    surface.damage_buffer(0, 0, w, h);
+                    surface.commit();
+                }
+                state.params_pending = false;
+                state.create_size = None;
+            }
+            // Creation failed: try again on the next configure.
+            zwp_linux_buffer_params_v1::Event::Failed => {
+                params.destroy();
+                eprintln!("linux-dmabuf buffer creation failed");
+                state.params_pending = false;
+                state.create_size = None;
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(
+        State,
+        zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        [zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, AppData)]
+    );
+}
+
+impl Dispatch<wl_buffer::WlBuffer, AppData> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_buffer::WlBuffer,
+        _event: wl_buffer::Event,
+        _data: &AppData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, AppData> for State {
     fn event(
         _state: &mut Self,
@@ -1069,8 +1182,6 @@ impl Dispatch<xdg_toplevel::XdgToplevel, AppData> for State {
 
 fn main() {
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland display");
-    let backend: Backend = conn.backend();
-    let display_ptr = backend.display_ptr() as *mut vk::wl_display;
 
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
@@ -1092,8 +1203,9 @@ fn main() {
         modifiers_printed: false,
         size: (WINDOW_WIDTH, WINDOW_HEIGHT),
         vk: None,
-        _surface_ptr: None,
-        _display_ptr: None,
+        qh: Some(qh.clone()),
+        params_pending: false,
+        create_size: None,
     };
 
     // Roundtrip once to read the globals and create the window.
@@ -1106,7 +1218,7 @@ fn main() {
     }
 
     // Create the window now that all globals are known.
-    state.init_window(&qh, display_ptr);
+    state.init_window(&qh);
 
     // Blocking dispatch loop until the window is closed by the compositor.
     while state.running {
