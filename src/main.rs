@@ -579,6 +579,7 @@ struct FrameData {
 
 /// One Vulkan image exported to the compositor as a DRM dmabuf.
 struct DmaBuffer {
+    device: ash::Device,
     image: vk::Image,
     memory: vk::DeviceMemory,
     fd: OwnedFd,
@@ -588,6 +589,15 @@ struct DmaBuffer {
     /// Whether this buffer has ever been presented to the compositor. Until a
     /// buffer is presented for the first time there is nothing to wait on.
     presented: bool,
+}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.free_memory(self.memory, None);
+            self.device.destroy_image(self.image, None);
+        }
+    }
 }
 
 /// A buffer handed to the Wayland layer to wrap in a wl_buffer, together with
@@ -1107,6 +1117,7 @@ impl Vulkan {
             }
 
             Ok(DmaBuffer {
+                device: self.device.clone(),
                 image,
                 memory,
                 fd,
@@ -1167,11 +1178,7 @@ impl Drop for Vulkan {
 
             self.destroy_frame();
             for slot in &mut self.buffers {
-                if let Some(buffer) = slot.take() {
-                    self.device.destroy_image(buffer.image, None);
-                    self.device.free_memory(buffer.memory, None);
-                    // buffer.fd closes on drop.
-                }
+                slot.take();
             }
             if self.command_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.command_pool, None);
