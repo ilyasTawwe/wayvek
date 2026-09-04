@@ -1,5 +1,7 @@
 use std::os::unix::io::OwnedFd;
 
+use ash::vk;
+
 use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS, open_render_node};
 use crate::renderer::vulkan::Vulkan;
 use crate::{DmaFrame, ExplicitSync};
@@ -42,6 +44,10 @@ impl Swapchain {
     /// Produce the next frame: wait on backpressure, ask the Renderer to draw,
     /// and bridge the resulting sync-file to the DRM syncobj timeline.
     ///
+    /// The caller provides a `record` closure that receives the device,
+    /// command buffer, and image handle to record GPU commands
+    /// (see [`Vulkan::draw`]).
+    ///
     /// Returns the DMA-BUF frame metadata and the explicit synchronization
     /// points for the Wayland backend to apply at commit time.
     pub fn next_frame(
@@ -49,6 +55,7 @@ impl Swapchain {
         renderer: &mut Vulkan,
         width: u32,
         height: u32,
+        record: impl FnOnce(usize, ash::Device, vk::CommandBuffer, vk::Image),
     ) -> Result<(DmaFrame, ExplicitSync), String> {
         // 1. Rotate buffer slot.
         self.current_idx = (self.current_idx + 1) % 2;
@@ -66,7 +73,7 @@ impl Swapchain {
         }
 
         // 3. Production: ask the Renderer to draw into the current buffer.
-        let (frame, sync_file) = renderer.draw(self.current_idx, width, height)?;
+        let (frame, sync_file) = renderer.draw(self.current_idx, width, height, record)?;
 
         // 4. Sync logic: import the Vulkan completion fence (sync-file) into
         //    the DRM syncobj timeline. The compositor waits on the returned

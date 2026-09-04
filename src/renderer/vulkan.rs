@@ -7,9 +7,6 @@ use drm_fourcc::DrmFourcc;
 
 use crate::{DmaFrame, DmaPlane};
 
-/// Window color as normalized floats (0.0-1.0) for vkCmdClearColorImage.
-const CLEAR_COLOR: [f32; 4] = [0.18, 0.18, 0.64, 1.0];
-
 /// A frame's worth of GPU work: one command buffer (reused) and one fence.
 struct FrameData {
     command_buffer: vk::CommandBuffer,
@@ -114,13 +111,25 @@ impl Vulkan {
         self.buffer_fmt = Some((fourcc, vk_format, modifier));
     }
 
-    /// Render a cleared frame into the current DMA-backed buffer and return
-    /// its exported DMA-BUF metadata and the GPU completion fence as a sync-file fd.
+    /// Render a frame into the current DMA-backed buffer and return its
+    /// exported DMA-BUF metadata and the GPU completion fence as a sync-file fd.
+    ///
+    /// The caller provides a `record` closure that receives the device,
+    /// command buffer (already begun), and image handle (initially in
+    /// `UNDEFINED` layout) and records GPU commands.  The renderer handles
+    /// buffer creation, command-buffer begin/end, queue submission, and
+    /// fence export.
     ///
     /// This method is purely GPU-side: it has no knowledge of Wayland protocols
     /// or DRM syncobj timelines. The caller (Swapchain) is responsible for
     /// backpressure (waiting on buffer release) and timeline synchronization.
-    pub fn draw(&mut self, slot: usize, width: u32, height: u32) -> Result<(DmaFrame, OwnedFd), String> {
+    pub fn draw(
+        &mut self,
+        slot: usize,
+        width: u32,
+        height: u32,
+        record: impl FnOnce(usize, ash::Device, vk::CommandBuffer, vk::Image),
+    ) -> Result<(DmaFrame, OwnedFd), String> {
         // SAFETY: this block invokes Vulkan command-buffer recording, queue
         // submission, and fd export. All Vulkan handles are valid (created in
         // `new`/`create_buffer`); errors are propagated via `map_err(..)?`.
@@ -158,69 +167,13 @@ impl Vulkan {
             // complete before we reuse this command buffer. The fence is only
             // used to export a sync-file for the compositor's acquire fence.
 
-            // Record a command buffer that clears the image to CLEAR_COLOR.
+            // Begin command buffer and let the caller record GPU commands.
             let begin_info = vk::CommandBufferBeginInfo::default();
             self.device
                 .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| format!("begin command buffer: {e}"))?;
 
-            let subresource = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .level_count(1)
-                .layer_count(1);
-
-            // UNDEFINED -> TRANSFER_DST_OPTIMAL
-            let to_transfer = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&to_transfer),
-            );
-
-            let clear_value = vk::ClearColorValue {
-                float32: CLEAR_COLOR,
-            };
-            let clear_range = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .level_count(1)
-                .layer_count(1);
-            self.device.cmd_clear_color_image(
-                command_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear_value,
-                std::slice::from_ref(&clear_range),
-            );
-
-            // TRANSFER_DST_OPTIMAL -> GENERAL (compositor reads the dmabuf).
-            let to_general = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&to_general),
-            );
+            record(slot, self.device.clone(), command_buffer, image);
 
             self.device
                 .end_command_buffer(command_buffer)
