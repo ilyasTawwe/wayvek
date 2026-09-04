@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
@@ -21,6 +21,7 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use rustix::fs::{major, minor};
+use rustix::ioctl::{self, opcode, Updater};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use zerocopy::FromBytes;
 
@@ -31,26 +32,27 @@ use zerocopy::FromBytes;
 // set_acquire_point/set_release_point at commit time. Mirrors egl-wayland2's
 // wayland-timeline.c.
 
-const DRM_IOCTL_BASE: u32 = 0x64; // 'd'
 const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
 const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE: u32 = 1 << 1;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
 
-const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> libc::c_ulong {
-    ((dir as libc::c_ulong) << 30)
-        | ((ty as libc::c_ulong) << 8)
-        | (nr as libc::c_ulong)
-        | ((size as libc::c_ulong) << 16)
-}
-const fn iowr(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
-    ioc(3, ty, nr, size) // _IOC_READ | _IOC_WRITE
-}
-const DRM_IOCTL_SYNCOBJ_CREATE: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xBF, 8);
-const DRM_IOCTL_SYNCOBJ_DESTROY: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC0, 8);
-const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC1, 24);
-const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC2, 24);
-const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xCA, 48);
-const DRM_IOCTL_SYNCOBJ_TRANSFER: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xCC, 32);
+// Type-safe rustix ioctl opcodes for the DRM syncobj API on the render node.
+// Each opcode is derived from the classic `_IOWR` macro (group 'd'/0x64); the
+// data size is computed by rustix from the size of the #[repr(C)] struct, and
+// the `_IOWR` direction matches the kernel's read-write struct semantics. These
+// replace the previous manual `ioc`/`iowr` bit-shifting code.
+const DRM_IOCTL_SYNCOBJ_CREATE_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjCreate>(b'd', 0xBF);
+const DRM_IOCTL_SYNCOBJ_DESTROY_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjDestroy>(b'd', 0xC0);
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjHandle>(b'd', 0xC1);
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjHandle>(b'd', 0xC2);
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjTimelineWait>(b'd', 0xCA);
+const DRM_IOCTL_SYNCOBJ_TRANSFER_OP: ioctl::Opcode =
+    opcode::read_write::<DrmSyncobjTransfer>(b'd', 0xCC);
 
 /// How long to wait for the compositor to release a buffer (10s) before giving
 /// up and reusing it anyway. The compositor should signal promptly.
@@ -104,19 +106,22 @@ struct DrmSyncobjTimelineWait {
     deadline_nsec: u64,
 }
 
-unsafe fn drm_ioctl<T>(fd: &OwnedFd, request: libc::c_ulong, data: &mut T) -> std::io::Result<()> {
-    let ret = unsafe {
-        libc::ioctl(
-            fd.as_raw_fd(),
-            request,
-            data as *mut T as *mut libc::c_void,
-        )
-    };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+/// Run a type-safe rustix `_IOWR` ioctl (`Updater`) against the DRM render node.
+///
+/// # Safety
+///
+/// `value` must be a `#[repr(C)]` struct whose layout and in/out semantics match
+/// the kernel-side `struct drm_syncobj_*` the `OPCODE` corresponds to. The fd
+/// must be an open, valid DRM render node. The kernel only ever reads/writes
+/// within `size_of::<T>()` bytes, so this is sound as long as `T` matches the
+/// ioctl contract.
+unsafe fn drm_ioctl_rw<T, const OP: ioctl::Opcode>(
+    fd: &OwnedFd,
+    value: &mut T,
+) -> std::io::Result<()> {
+    // SAFETY: as documented above; `Updater` requests `_IOWR` semantics.
+    unsafe { ioctl::ioctl(fd, Updater::<OP, T>::new(value)) }
+        .map_err(std::io::Error::from)
 }
 
 /// A DRM syncobj *timeline* created on the render node and shared with the
@@ -139,7 +144,9 @@ impl DrmSyncobj {
             handle: 0,
             flags: 0,
         };
-        unsafe { drm_ioctl(&fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut create)? };
+        // SAFETY: `DrmSyncobjCreate` matches `struct drm_syncobj_create`; the
+        // render node fd is valid and read-write open.
+        unsafe { drm_ioctl_rw::<DrmSyncobjCreate, DRM_IOCTL_SYNCOBJ_CREATE_OP>(&fd, &mut create)? };
         Ok(Self {
             fd,
             handle: create.handle,
@@ -157,13 +164,13 @@ impl DrmSyncobj {
             fd: -1,
             ..Default::default()
         };
-        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut hand)? };
+        // SAFETY: `DrmSyncobjHandle` matches `struct drm_syncobj_handle`; the
+        // kernel writes the exported fd into the `fd` field.
+        unsafe { drm_ioctl_rw::<DrmSyncobjHandle, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD_OP>(&self.fd, &mut hand)? };
         if hand.fd < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "syncobj HANDLE_TO_FD gave no fd",
-            ));
+            return Err(std::io::Error::other("syncobj HANDLE_TO_FD gave no fd"));
         }
+        // SAFETY: the kernel has allocated a fresh fd>=0; we take ownership.
         Ok(unsafe { OwnedFd::from_raw_fd(hand.fd) })
     }
 
@@ -176,8 +183,11 @@ impl DrmSyncobj {
 
         // Create a throwaway binary syncobj to receive the imported sync-file.
         let mut create = DrmSyncobjCreate { handle: 0, flags: 0 };
-        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut create)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("create temp syncobj: {e}")))? };
+        // SAFETY: as `create()` above; fresh temp syncobj handle is written out.
+        unsafe {
+            drm_ioctl_rw::<DrmSyncobjCreate, DRM_IOCTL_SYNCOBJ_CREATE_OP>(&self.fd, &mut create)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("create temp syncobj: {e}")))?
+        };
 
         // Import the sync-file into that existing temp syncobj. The kernel
         // resolves `handle` as the DESTINATION object for the import, so it must
@@ -188,8 +198,12 @@ impl DrmSyncobj {
             fd: syncfile_fd.as_raw_fd(),
             ..Default::default()
         };
-        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut import)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("import sync-file fd_to_handle: {e}")))? };
+        // SAFETY: `DrmSyncobjHandle` matches `struct drm_syncobj_handle`; import
+        // semantics are write-only from the kernel's perspective.
+        unsafe {
+            drm_ioctl_rw::<DrmSyncobjHandle, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE_OP>(&self.fd, &mut import)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("import sync-file fd_to_handle: {e}")))?
+        };
         let temp = create.handle;
 
         // Transfer that syncobj's fence onto the timeline at the acquire point.
@@ -201,14 +215,21 @@ impl DrmSyncobj {
             flags: 0,
             pad: 0,
         };
-        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &mut transfer)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("timeline transfer: {e}")))? };
+        // SAFETY: `DrmSyncobjTransfer` matches `struct drm_syncobj_transfer`.
+        unsafe {
+            drm_ioctl_rw::<DrmSyncobjTransfer, DRM_IOCTL_SYNCOBJ_TRANSFER_OP>(&self.fd, &mut transfer)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("timeline transfer: {e}")))?
+        };
 
         let mut destroy = DrmSyncobjDestroy {
             handle: temp,
             pad: 0,
         };
-        let _ = unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut destroy) };
+        // SAFETY: `DrmSyncobjDestroy` matches `struct drm_syncobj_destroy`;
+        // best-effort cleanup of the temp handle after the transfer.
+        let _ = unsafe {
+            drm_ioctl_rw::<DrmSyncobjDestroy, DRM_IOCTL_SYNCOBJ_DESTROY_OP>(&self.fd, &mut destroy)
+        };
 
         // The compositor signals the next point when it is done with the buffer.
         self.point = acquire_point;
@@ -230,7 +251,9 @@ impl DrmSyncobj {
             flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
             ..Default::default()
         };
-        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut wait) }
+        // SAFETY: `handles`/`points` point at valid, aligned local variables the
+        // kernel reads; `DrmSyncobjTimelineWait` layout matches the kernel struct.
+        unsafe { drm_ioctl_rw::<DrmSyncobjTimelineWait, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_OP>(&self.fd, &mut wait) }
     }
 }
 
@@ -240,7 +263,11 @@ impl Drop for DrmSyncobj {
             handle: self.handle,
             pad: 0,
         };
-        let _ = unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut destroy) };
+        // SAFETY: `DrmSyncobjDestroy` matches `struct drm_syncobj_destroy`;
+        // best-effort cleanup; errors are intentionally ignored in Drop.
+        let _ = unsafe {
+            drm_ioctl_rw::<DrmSyncobjDestroy, DRM_IOCTL_SYNCOBJ_DESTROY_OP>(&self.fd, &mut destroy)
+        };
     }
 }
 
@@ -264,48 +291,57 @@ struct FormatTableEntry {
     modifier: u64,
 }
 
-/// A memory-mapped copy of the compositor's linux-dmabuf format table.
+/// A memory-mapped, zero-copy view of the compositor's linux-dmabuf format
+/// table. The mmap'd fd bytes are interpreted directly as `&[FormatTableEntry]`
+/// without any per-entry allocation or copying.
 struct DrmFormatTable {
     ptr: *mut std::ffi::c_void,
     size: usize,
-    entries: Vec<(u32, u64)>,
+    entries: &'static [FormatTableEntry],
 }
 
 impl DrmFormatTable {
-    /// Map the fd and parse its (format, modifier) entries. Returns None on error.
+    /// Map the fd and expose its (format, modifier) entries as a packed slice.
+    /// Returns None on error.
     fn map(fd: OwnedFd, size: u32) -> Option<Self> {
-        unsafe {
-            let size = size as usize;
-            let ptr = mmap(
+        // SAFETY: `fd` is a fresh mmap source returned by the compositor; we map
+        // it read-only (MAP_PRIVATE + READ), so no aliasing writes occur. The
+        // returned pointer is held by `DrmFormatTable` and munmap'd on drop, so
+        // the slice never outlives the mapping.
+        let ptr = unsafe {
+            mmap(
                 std::ptr::null_mut(),
-                size,
+                size as usize,
                 ProtFlags::READ,
                 MapFlags::PRIVATE,
                 &fd,
                 0,
             )
-            .ok()?;
-            let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
-            let mut entries = Vec::with_capacity(size / 16);
-            // Decode each packed 16-byte entry with zero-copy parsing. Entries
-            // are kept in table order (even if the fourcc doesn't parse) so
-            // tranche indices keep mapping to the right slot.
-            for chunk in bytes.chunks_exact(16) {
-                if let Some(entry) = FormatTableEntry::ref_from_bytes(chunk).ok() {
-                    entries.push((entry.format, entry.modifier));
-                }
-            }
-            Some(Self { ptr, size, entries })
-        }
+            .ok()?
+        };
+        // SAFETY: `ptr` is valid for `size` readable bytes (just mapped).
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) };
+        let count = bytes.len() / std::mem::size_of::<FormatTableEntry>();
+        // Zero-copy: reinterpret the mmap'd bytes directly as the packed entry
+        // slice, with no per-entry allocation or decoding loop. Returns None if
+        // the length is not a multiple of the entry size.
+        let entries = <[FormatTableEntry]>::ref_from_bytes_with_elems(bytes, count).ok()?;
+        Some(Self {
+            ptr,
+            size: size as usize,
+            entries,
+        })
     }
 
     fn get(&self, index: usize) -> Option<(u32, u64)> {
-        self.entries.get(index).copied()
+        self.entries.get(index).map(|e| (e.format, e.modifier))
     }
 }
 
 impl Drop for DrmFormatTable {
     fn drop(&mut self) {
+        // SAFETY: `ptr` (length `size`) was returned by `mmap` and is still
+        // valid; we destroy the mapping while `entries` is the last live borrow.
         unsafe {
             let _ = munmap(self.ptr, self.size);
         }
@@ -355,9 +391,6 @@ struct State {
     vk: Option<Vulkan>,
     // Queue handle used to create wayland buffer objects at present time.
     qh: Option<QueueHandle<Self>>,
-    // Set while a zwp_linux_buffer_params create is awaiting its "created"
-    // event, so we don't spam the compositor with overlapping creations.
-    params_pending: bool,
     // Size (in pixels) of the buffer currently being created, for attach.
     create_size: Option<(i32, i32)>,
     // Explicit synchronization (wp_linux_drm_syncobj_v1): the compositor-side
@@ -415,16 +448,17 @@ impl State {
     }
 
     /// Lazily (re)create a drm-backed buffer, render a cleared frame into it,
-    /// and hand the exported dmabuf to the compositor as a wl_buffer.
+    /// and hand the exported dmabuf to the compositor as a wl_buffer. The CPU
+    /// is throttled inside [`Vulkan::present`] by waiting on the DRM syncobj
+    /// timeline release point of the buffer being reused; no separate
+    /// `params_pending` flag is needed.
     fn render(&mut self, width: u32, height: u32) {
-        // Skip presenting while a previous buffer creation is still in flight.
-        if self.params_pending {
-            return;
-        }
-
         // Initialise the Vulkan renderer on first render.
         if self.vk.is_none() {
-            let main_device = self.main_device.unwrap();
+            let Some(main_device) = self.main_device else {
+                eprintln!("render skipped: no main DRM device yet");
+                return;
+            };
             match Vulkan::new(main_device) {
                 Ok(mut vk) => {
                     // Once, when both the feedback tranches and the Vulkan
@@ -452,11 +486,13 @@ impl State {
             else {
                 panic!("wp_linux_drm_syncobj_manager_v1 is not available");
             };
-            let import_fd = self
-                .vk
-                .as_ref()
-                .and_then(|vk| vk.syncobj_import_fd())
-                .expect("no DRM syncobj to import");
+            let import_fd = match self.vk.as_ref().and_then(|vk| vk.syncobj_import_fd()) {
+                Some(fd) => fd,
+                None => {
+                    eprintln!("render skipped: no DRM syncobj to import");
+                    return;
+                }
+            };
             let timeline = manager.import_timeline(import_fd.as_fd(), &qh2, AppData);
             self.syncobj_timeline = Some(timeline);
         }
@@ -465,7 +501,10 @@ impl State {
             return;
         };
 
-        let vk = self.vk.as_mut().unwrap();
+        let Some(vk) = self.vk.as_mut() else {
+            eprintln!("render skipped: Vulkan renderer not initialized");
+            return;
+        };
         let presented = match vk.present(width, height) {
             Ok(p) => p,
             Err(e) => {
@@ -499,7 +538,6 @@ impl State {
             zwp_linux_buffer_params_v1::Flags::empty(),
         );
 
-        self.params_pending = true;
         self.create_size = Some((presented.width, presented.height));
     }
 
@@ -547,6 +585,9 @@ struct DmaBuffer {
     planes: Vec<DmaPlane>,
     /// Track when THIS specific buffer is safe to reuse.
     last_release_point: Option<u64>,
+    /// Whether this buffer has ever been presented to the compositor. Until a
+    /// buffer is presented for the first time there is nothing to wait on.
+    presented: bool,
 }
 
 /// A buffer handed to the Wayland layer to wrap in a wl_buffer, together with
@@ -593,6 +634,11 @@ struct Vulkan {
 
 impl Vulkan {
     fn new(main_device: u64) -> Result<Self, String> {
+        // SAFETY: all ash entry points here require an initialized `Entry` and
+        // `Instance`; `create_instance`/`create_device` return valid handles on
+        // success, and the loaders are constructed from those valid handles. On
+        // any error we propagate without leaking handles (each step owns its
+        // dependencies, which are dropped when `Self` construction short-circuits).
         unsafe {
             let entry = Entry::load().map_err(|e| e.to_string())?;
             let instance = create_instance(&entry)?;
@@ -642,11 +688,18 @@ impl Vulkan {
     /// Returns the DRM modifiers the physical device supports for `format` as
     /// `VkDrmFormatModifierPropertiesEXT` values (modifier, planes, tiling).
     fn vulkan_modifiers(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        // SAFETY: `get_physical_device_format_properties2` and its p_next chain
+        // (`DrmFormatModifierPropertiesListEXT`) are valid two-pass queries; the
+        // `mods` buffer is sized exactly to `count`, and its lifetime outlives
+        // the call so the driver may write into it.
         unsafe {
             // First pass: query the count of supported modifiers.
-            let mut props2 = vk::FormatProperties2::default();
             let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-            props2.p_next = &mut list as *mut _ as *mut std::os::raw::c_void;
+            let mut props2 = vk::FormatProperties2 {
+                // SAFETY (chain): `list` is a valid linked struct; see fn doc.
+                p_next: &mut list as *mut _ as *mut std::os::raw::c_void,
+                ..Default::default()
+            };
             self.instance
                 .get_physical_device_format_properties2(self.physical_device, format, &mut props2);
 
@@ -659,8 +712,11 @@ impl Vulkan {
             let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
             let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
                 .drm_format_modifier_properties(&mut mods);
-            let mut props2 = vk::FormatProperties2::default();
-            props2.p_next = &mut list as *mut _ as *mut std::os::raw::c_void;
+            let mut props2 = vk::FormatProperties2 {
+                // SAFETY (chain): `list` points at `mods` (valid for `count`).
+                p_next: &mut list as *mut _ as *mut std::os::raw::c_void,
+                ..Default::default()
+            };
             self.instance
                 .get_physical_device_format_properties2(self.physical_device, format, &mut props2);
 
@@ -733,11 +789,24 @@ impl Vulkan {
 
     /// Render a cleared frame into the (current) drm-backed buffer and return
     /// its exported dmabuf for the Wayland layer to wrap in a wl_buffer.
+    ///
+    /// This is the application's heartbeat: it blocks on the DRM syncobj
+    /// timeline release point of the buffer being reused, so the CPU only
+    /// advances once the compositor has signalled that the previous buffer has
+    /// been released. Any error (device lost, DRM node busy, timeout) is
+    /// returned as `Err` so the caller can log and skip the frame gracefully.
     fn present(&mut self, width: u32, height: u32) -> Result<PresentedBuffer, String> {
+        // SAFETY: this block invokes Vulkan command-buffer recording, queue
+        // submission, and fd export. The device/queue/command-buffer/fence
+        // handles are all valid (created in `new`/`create_buffer`); the DrmSyncobj
+        // ioctls are safe per `drm_ioctl_rw`. Every call returns its error via
+        // `map_err(..)?` so nothing panics on GPU device loss or a busy DRM node.
         unsafe {
             // 1. Handle Resize: Clear the pool if dimensions changed.
             if self.extent.width != width || self.extent.height != height {
-                self.device.device_wait_idle().unwrap();
+                self.device
+                    .device_wait_idle()
+                    .map_err(|e| format!("wait idle on resize: {e}"))?;
                 self.buffers = [None, None];
                 self.extent = vk::Extent2D { width, height };
             }
@@ -753,20 +822,25 @@ impl Vulkan {
                     Some(self.create_buffer(width, height, drm_format, vk_format, modifier)?);
             }
 
-            let buf = self.buffers[self.current_idx].as_mut().unwrap();
+            let buf = self.buffers[self.current_idx]
+                .as_mut()
+                .ok_or("buffer slot was not created")?;
 
-            // 4. THE FIX: Only wait if this specific buffer is currently being held
-            // by the compositor. Because we use two buffers, the compositor is
-            // usually done with 'buf' by the time we rotate back to it, so this
-            // wait returns immediately.
-            if let Some(wait_point) = buf.last_release_point {
-                let syncobj = self.syncobj.as_ref().expect("no DRM syncobj");
+            // 4. Throttle reuse on the explicit-sync timeline. Only a buffer that
+            // has previously been presented carries a release point to wait on;
+            // the compositor signals it once it is done with the buffer, so
+            // blocking here is the CPU heartbeat instead of a params_pending flag.
+            if let Some(wait_point) = buf.last_release_point.filter(|_| buf.presented) {
+                let syncobj = self.syncobj.as_ref().ok_or("no DRM syncobj for release wait")?;
                 syncobj
                     .wait_release(wait_point, WAIT_RELEASE_TIMEOUT_NS)
-                    .map_err(|e| format!("Buffer reuse timeout: {e}"))?;
+                    .map_err(|e| format!("buffer reuse wait failed: {e}"))?;
             }
 
-            let frame = self.frame.as_mut().unwrap();
+            let frame = self
+                .frame
+                .as_mut()
+                .ok_or("frame resources were not created")?;
             let image = buf.image;
             let command_buffer = frame.command_buffer;
 
@@ -840,11 +914,13 @@ impl Vulkan {
                 .reset_fences(std::slice::from_ref(&frame.fence))
                 .map_err(|e| format!("reset fence: {e}"))?;
 
-            let submit = vk::SubmitInfo::default()
-                .command_buffers(std::slice::from_ref(&command_buffer));
+            // Submit via the Vulkan 1.3 synchronization-2 entry point.
+            let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
+            let submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(std::slice::from_ref(&cb_info));
             self.device
-                .queue_submit(self.queue, std::slice::from_ref(&submit), frame.fence)
-                .map_err(|e| format!("queue submit: {e}"))?;
+                .queue_submit2(self.queue, std::slice::from_ref(&submit), frame.fence)
+                .map_err(|e| format!("queue submit2: {e}"))?;
 
             // No CPU wait needed for the clear itself: we hand the compositor an
             // explicit acquire fence via the syncobj timeline instead.
@@ -860,7 +936,7 @@ impl Vulkan {
             // Attach our rendering fence onto the timeline. The compositor waits
             // on the returned acquire point before sampling the buffer, and
             // signals the following release point when it is done with it.
-            let syncobj = self.syncobj.as_mut().unwrap();
+            let syncobj = self.syncobj.as_mut().ok_or("no DRM syncobj")?;
             let acquire_point = syncobj
                 .attach_sync_file(&syncfd)
                 .map_err(|e| format!("attach sync-file to timeline: {e}"))?;
@@ -869,6 +945,7 @@ impl Vulkan {
             // 5. Store the release point on the buffer so we know when it's
             // safe to reuse next time.
             buf.last_release_point = Some(release_point);
+            buf.presented = true;
 
             // Hand the consumer a dup of the fd; the buffer keeps its own copy
             // for reuse on the next frame.
@@ -906,6 +983,12 @@ impl Vulkan {
         vk_format: vk::Format,
         modifier: u64,
     ) -> Result<DmaBuffer, String> {
+        // SAFETY: creates a DRM-format-modifier image, allocates exportable
+        // device memory, binds them, exports a dmabuf fd, and composes the
+        // p_next chain (`external` -> `drm_info`). All Vulkan handles are valid,
+        // the allocator structs are `#[repr(C)]`, and each `create_*/get_*`
+        // call propagates errors via `map_err(..)?`. The exported fd is wrapped
+        // in `OwnedFd` so it is not leaked.
         unsafe {
             let extent = vk::Extent2D {
                 width,
@@ -1029,22 +1112,30 @@ impl Vulkan {
                 fd,
                 planes,
                 last_release_point: None,
+                presented: false,
             })
         }
     }
 
     /// A memory type that is device-local and included in `req.memory_type_bits`.
     fn pick_exportable_memory_type(&self, req: vk::MemoryRequirements) -> Option<u32> {
+        // SAFETY: `get_physical_device_memory_properties` returns a valid
+        // `memory_type_count` and `memory_types` array owned by the driver for
+        // the lifetime of the physical device; indexing within the count is safe.
         unsafe {
             let props = self
                 .instance
                 .get_physical_device_memory_properties(self.physical_device);
-            for i in 0..props.memory_type_count as usize {
-                if (req.memory_type_bits & (1 << i)) != 0 {
-                    let mt = props.memory_types[i];
-                    if mt.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
-                        return Some(i as u32);
-                    }
+            for (i, mt) in props
+                .memory_types
+                .iter()
+                .enumerate()
+                .take(props.memory_type_count as usize)
+            {
+                if (req.memory_type_bits & (1 << i)) != 0
+                    && mt.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                {
+                    return Some(i as u32);
                 }
             }
             None
@@ -1052,6 +1143,9 @@ impl Vulkan {
     }
 
     fn destroy_frame(&mut self) {
+        // SAFETY: `destroy_fence` on a valid fence handle is an allowed
+        // destruction call; the fence is removed from `self.frame` first so it
+        // cannot be used after destruction.
         unsafe {
             if let Some(frame) = self.frame.take() {
                 self.device.destroy_fence(frame.fence, None);
@@ -1062,9 +1156,14 @@ impl Vulkan {
 
 impl Drop for Vulkan {
     fn drop(&mut self) {
+        // SAFETY: Destroying the logical device, images, memory, command pool,
+        // and instance is the standard teardown path; all Vulkan handles are
+        // valid and no other thread is using them at drop time.
         unsafe {
             // Ensure all in-flight rendering has completed before destroying.
-            self.device.device_wait_idle().unwrap();
+            // Best-effort: a lost device leaves nothing to wait on, so ignore
+            // the error here (destruction proceeds regardless).
+            let _ = self.device.device_wait_idle();
 
             self.destroy_frame();
             for slot in &mut self.buffers {
@@ -1085,25 +1184,32 @@ impl Drop for Vulkan {
 
 fn create_instance(entry: &Entry) -> Result<Instance, String> {
     unsafe {
-        let app_name = c_str("wayvek");
-        let engine_name = c_str("wayvek");
         let app_info = vk::ApplicationInfo::default()
             .api_version(vk::make_api_version(0, 1, 3, 0))
-            .application_name(&app_name)
+            .application_name(c"wayvek")
             .application_version(1)
-            .engine_name(&engine_name)
+            .engine_name(c"wayvek")
             .engine_version(1);
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&[]);
 
+        // SAFETY: `app_info` and `create_info` are valid Vulkan descriptions
+        // with internal pointers to `c"wayvek"` (which live for 'static).
         entry
             .create_instance(&create_info, None)
             .map_err(|e| format!("create instance: {e}"))
     }
 }
 
+/// Select the physical device whose render DRM node matches the compositor's
+/// preferred device, and return its graphics queue family.
+///
+/// This performs a single `get_physical_device_properties2` call per candidate
+/// with a single `p_next` chain (`Vulkan11Properties -> DrmPropertiesEXT`) so
+/// that the GPU identity and the DRM major/minor are gathered atomically, and
+/// the queue-family scan is done directly on the match.
 fn pick_physical_device(
     instance: &Instance,
     dev: u64,
@@ -1115,53 +1221,41 @@ fn pick_physical_device(
             .map_err(|e| format!("enumerate physical devices: {e}"))?;
 
         for device in &devices {
-            let (q, name) = match find_queue_family(instance, *device) {
-                Some(x) => x,
-                None => continue,
-            };
-            if device_drm_matches(instance, *device, major, minor) {
+            // Build the p_next chain in a single call: properties2 -> vulkan11
+            // -> drm. The DRM extension gives us the render-node identity, and
+            // Vulkan11Properties is carried along for a future-proof atomic query.
+            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut vulkan11 = vk::PhysicalDeviceVulkan11Properties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default();
+            // SAFETY: each struct in the chain is `#[repr(C)]` with a matching
+            // `s_type`, and the lifetimes outlast the call; we only read them
+            // afterwards.
+            vulkan11.p_next = &mut drm as *mut _ as *mut std::os::raw::c_void;
+            props2.p_next = &mut vulkan11 as *mut _ as *mut std::os::raw::c_void;
+            instance.get_physical_device_properties2(*device, &mut props2);
+
+            let drm_matches = drm.has_render == vk::TRUE
+                && drm.render_major as u32 == major
+                && drm.render_minor as u32 == minor;
+            if !drm_matches {
+                continue;
+            }
+
+            // Find a graphics queue family on this device.
+            let queue_families = instance.get_physical_device_queue_family_properties(*device);
+            let queue_family = queue_families
+                .iter()
+                .enumerate()
+                .find(|(_, qf)| qf.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|(i, _)| i as u32);
+            if let Some(q) = queue_family {
+                let name = cstr_to_string(props2.properties.device_name.as_ptr());
                 eprintln!("using main GPU: {name}");
                 return Ok((*device, q));
             }
         }
 
         Err(format!("no Vulkan device matched main DRM {major}:{minor}"))
-    }
-}
-
-/// Return the first queue family index that supports graphics, if any.
-fn find_queue_family(
-    instance: &Instance,
-    device: vk::PhysicalDevice,
-) -> Option<(u32, String)> {
-    unsafe {
-        let props = instance.get_physical_device_properties(device);
-        let name = cstr_to_string(props.device_name.as_ptr());
-        let queue_families = instance.get_physical_device_queue_family_properties(device);
-        for (i, qf) in queue_families.iter().enumerate() {
-            if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                return Some((i as u32, name));
-            }
-        }
-        None
-    }
-}
-
-/// Whether the physical device's primary/render DRM node matches the given
-/// dev_t (major, minor) reported by the compositor, via VK_EXT_physical_device_drm.
-fn device_drm_matches(
-    instance: &Instance,
-    device: vk::PhysicalDevice,
-    major: u32,
-    minor: u32,
-) -> bool {
-    unsafe {
-        let mut props2 = vk::PhysicalDeviceProperties2::default();
-        let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
-        props2.p_next = &mut drm as *mut _ as *mut std::os::raw::c_void;
-        instance.get_physical_device_properties2(device, &mut props2);
-
-        drm.has_render == vk::TRUE && drm.render_major as u32 == major && drm.render_minor as u32 == minor
     }
 }
 
@@ -1174,7 +1268,6 @@ fn open_render_node(dev: u64) -> std::io::Result<OwnedFd> {
         rustix::fs::OFlags::RDWR,
         rustix::fs::Mode::empty(),
     )
-    .map(Into::into)
     .map_err(std::io::Error::from)
 }
 
@@ -1183,6 +1276,11 @@ fn create_device(
     physical_device: vk::PhysicalDevice,
     queue_family: u32,
 ) -> Result<ash::Device, String> {
+    // SAFETY: `create_device` is called with a valid `Instance` and
+    // `PhysicalDevice`; the queue create info and extension list are valid
+    // `#[repr(C)]` structures referencing `'static` C-string extension names
+    // (ash's `NAME` constants). The returned `ash::Device` is owned by this
+    // function's caller.
     unsafe {
         let priority = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -1196,9 +1294,15 @@ fn create_device(
             vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr(),
         ];
 
+        // Enable the Vulkan 1.3 synchronization2 feature so `queue_submit2` and
+        // `vk::SubmitInfo2` are usable on the queue.
+        let mut sync2_features = vk::PhysicalDeviceSynchronization2Features::default()
+            .synchronization2(true);
+
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
-            .enabled_extension_names(&device_extensions);
+            .enabled_extension_names(&device_extensions)
+            .push_next(&mut sync2_features);
 
         instance
             .create_device(physical_device, &create_info, None)
@@ -1222,22 +1326,21 @@ fn drm_fourcc_to_vk(fourcc: DrmFourcc) -> vk::Format {
     }
 }
 
-fn c_str(s: &str) -> CString {
-    CString::new(s).unwrap()
-}
-
+/// Converts a null-terminated C string pointer (e.g. a Vulkan device name) to
+/// a Rust `String`. A null pointer yields an empty string.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid, null-terminated UTF-8-compatible C string, or be
+/// null. Vulkan drivers provide such strings for `swapchain.pNext` device names.
 unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    unsafe {
-        let mut len = 0;
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
-        let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
-        String::from_utf8_lossy(bytes).into_owned()
-    }
+    // SAFETY: contract described on the function.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ----------------------------- Dispatch --------------------------------
@@ -1385,7 +1488,7 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, AppData> f
                 let mut pairs: Vec<(DrmFourcc, u64)> = Vec::new();
                 if let Some(table) = &state.format_table {
                     // Decode the packed u16 index array with zero-copy parsing.
-                    for pair in indices.chunks_exact(2) {
+                    for pair in indices.as_chunks::<2>().0 {
                         let Ok(idx) = u16::ref_from_bytes(pair) else { continue };
                         if let Some((format, modifier)) = table.get(*idx as usize)
                             && let Ok(code) = DrmFourcc::try_from(format)
@@ -1418,14 +1521,31 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, AppData> for S
                 params.destroy();
                 if let Some(surface) = &state.surface {
                     // Explicit sync: set the acquire/release timeline points that
-                    // apply to this commit, before attaching and committing.
+                    // apply to this commit, immediately before attaching and
+                    // committing, per the linux_drm_syncobj protocol contract.
                     let (Some(surface_sync), Some(timeline)) =
                         (&state.surface_sync, &state.syncobj_timeline)
                     else {
-                        panic!("explicit sync objects missing");
+                        eprintln!("explicit sync objects missing; dropping buffer");
+                        state.create_size = None;
+                        return;
                     };
-                    let acquire = state.pending_acquire.take().expect("no pending acquire point");
-                    let release = state.pending_release.take().expect("no pending release point");
+                    let acquire = match state.pending_acquire.take() {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("no pending acquire point; dropping buffer");
+                            state.create_size = None;
+                            return;
+                        }
+                    };
+                    let release = match state.pending_release.take() {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("no pending release point; dropping buffer");
+                            state.create_size = None;
+                            return;
+                        }
+                    };
                     surface_sync.set_acquire_point(timeline, (acquire >> 32) as u32, acquire as u32);
                     surface_sync.set_release_point(timeline, (release >> 32) as u32, release as u32);
 
@@ -1434,15 +1554,15 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, AppData> for S
                     surface.damage_buffer(0, 0, w, h);
                     surface.commit();
                 }
-                state.params_pending = false;
                 state.create_size = None;
             }
             // Creation failed: try again on the next configure.
             zwp_linux_buffer_params_v1::Event::Failed => {
                 params.destroy();
                 eprintln!("linux-dmabuf buffer creation failed");
-                state.params_pending = false;
                 state.create_size = None;
+                state.pending_acquire = None;
+                state.pending_release = None;
             }
             _ => {}
         }
@@ -1591,7 +1711,6 @@ fn main() {
         size: (WINDOW_WIDTH, WINDOW_HEIGHT),
         vk: None,
         qh: Some(qh.clone()),
-        params_pending: false,
         create_size: None,
         syncobj_manager: None,
         surface_sync: None,

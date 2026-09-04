@@ -10,4 +10,3 @@ ash = "0.38.0"
 drm-fourcc = "2.2.0"
 rustix = { version = "1", features = ["fs", "mm"] }
 zerocopy = { version = "0.8", features = ["derive"] }
-libc = "0.2"
