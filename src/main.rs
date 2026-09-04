@@ -1,8 +1,10 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::os::unix::io::OwnedFd;
 
 use ash::vk;
 use ash::{Entry, Instance};
+use drm_fourcc::DrmFourcc;
 use wayland_client::backend::{Backend, ObjectId};
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_surface};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -15,12 +17,90 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use rustix::fs::{major, minor};
+use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use zerocopy::FromBytes;
 
 const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
 
 // Window color as normalized floats (0.0-1.0) for vkCmdClearColorImage.
 const CLEAR_COLOR: [f32; 4] = [0.18, 0.18, 0.64, 1.0];
+
+// ------------------------- Format/modifier table --------------------------
+
+/// One entry of the linux-dmabuf format table: a `(u32 format, u32 padding,
+/// u64 modifier)`, tightly packed in native endianness.
+#[derive(
+    zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable, Copy, Clone,
+)]
+#[repr(C)]
+struct FormatTableEntry {
+    format: u32,
+    _pad: u32,
+    modifier: u64,
+}
+
+/// A memory-mapped copy of the compositor's linux-dmabuf format table.
+struct DrmFormatTable {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+    entries: Vec<(u32, u64)>,
+}
+
+impl DrmFormatTable {
+    /// Map the fd and parse its (format, modifier) entries. Returns None on error.
+    fn map(fd: OwnedFd, size: u32) -> Option<Self> {
+        unsafe {
+            let size = size as usize;
+            let ptr = mmap(
+                std::ptr::null_mut(),
+                size,
+                ProtFlags::READ,
+                MapFlags::PRIVATE,
+                &fd,
+                0,
+            )
+            .ok()?;
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+            let mut entries = Vec::with_capacity(size / 16);
+            // Decode each packed 16-byte entry with zero-copy parsing. Entries
+            // are kept in table order (even if the fourcc doesn't parse) so
+            // tranche indices keep mapping to the right slot.
+            for chunk in bytes.chunks_exact(16) {
+                if let Some(entry) = FormatTableEntry::ref_from_bytes(chunk).ok() {
+                    entries.push((entry.format, entry.modifier));
+                }
+            }
+            Some(Self { ptr, size, entries })
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<(u32, u64)> {
+        self.entries.get(index).copied()
+    }
+}
+
+impl Drop for DrmFormatTable {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = munmap(self.ptr, self.size);
+        }
+    }
+}
+
+// ---------------------------- DRM format info ----------------------------
+
+/// One DRM format, keeping both sides' information. Only the modifiers that
+/// are supported by both the compositor (Wayland) and the physical device
+/// (Vulkan) are stored, in the order the compositor advertised them.
+struct DrmFormatInfo {
+    code: DrmFourcc,
+    /// Modifiers offered by the compositor, in feedback tranche order.
+    wayland_modifiers: Vec<u64>,
+    /// The intersection of Wayland and Vulkan modifiers, each with the Vulkan
+    /// tiling/plane properties, in Wayland order.
+    available: Vec<vk::DrmFormatModifierPropertiesEXT>,
+}
 
 // ------------------------- Wayland state -------------------------------
 
@@ -38,6 +118,13 @@ struct State {
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     feedback: Option<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>,
     main_device: Option<u64>,
+    // Format/modifier table mmap'd from the feedback's format_table event, and
+    // the accumulated (format, modifier) pairs from the feedback tranches.
+    format_table: Option<DrmFormatTable>,
+    dmabuf_formats: Vec<DrmFormatInfo>,
+    // Whether the feedback done event and the modifier intersection have been
+    // printed, to avoid re-printing on every render.
+    modifiers_printed: bool,
     // Current window size in surface coordinates.
     size: (u32, u32),
     // Vulkan renderer, initialized once the surface + size are known.
@@ -96,7 +183,16 @@ impl State {
             let display_ptr = *display_ptr;
             let main_device = self.main_device.unwrap();
             match Vulkan::new(display_ptr, surface_ptr, main_device) {
-                Ok(vk) => self.vk = Some(vk),
+                Ok(vk) => {
+                    // Once, when both the feedback tranches and the Vulkan
+                    // device are available: compute and print the intersection.
+                    if !self.modifiers_printed && !self.dmabuf_formats.is_empty() {
+                        vk.compute_intersection(&mut self.dmabuf_formats);
+                        vk.print_formats(&self.dmabuf_formats);
+                        self.modifiers_printed = true;
+                    }
+                    self.vk = Some(vk);
+                }
                 Err(e) => {
                     eprintln!("vulkan init failed: {e}");
                     return;
@@ -107,6 +203,23 @@ impl State {
         let vk = self.vk.as_mut().unwrap();
         if let Err(e) = vk.present(width, height) {
             eprintln!("vulkan present failed: {e}");
+        }
+    }
+
+    /// Record a (format, modifier) pair from a feedback tranche, preserving the
+    /// order in which the compositor advertised them.
+    fn add_wayland_modifier(&mut self, code: DrmFourcc, modifier: u64) {
+        // Find the existing slot for this format, or append a new one in order.
+        if let Some(fmt) = self.dmabuf_formats.iter_mut().find(|f| f.code == code) {
+            if !fmt.wayland_modifiers.contains(&modifier) {
+                fmt.wayland_modifiers.push(modifier);
+            }
+        } else {
+            self.dmabuf_formats.push(DrmFormatInfo {
+                code,
+                wayland_modifiers: vec![modifier],
+                available: Vec::new(),
+            });
         }
     }
 }
@@ -191,6 +304,74 @@ impl Vulkan {
                 frames: Vec::new(),
                 current_frame: 0,
             })
+        }
+    }
+
+    /// Returns the DRM modifiers the physical device supports for `format` as
+    /// `VkDrmFormatModifierPropertiesEXT` values (modifier, planes, tiling).
+    fn vulkan_modifiers(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        unsafe {
+            // First pass: query the count of supported modifiers.
+            let mut props2 = vk::FormatProperties2::default();
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+            props2.p_next = &mut list as *mut _ as *mut std::os::raw::c_void;
+            self.instance
+                .get_physical_device_format_properties2(self.physical_device, format, &mut props2);
+
+            let count = list.drm_format_modifier_count as usize;
+            if count == 0 {
+                return Vec::new();
+            }
+
+            // Second pass: fill in the array of modifier properties.
+            let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut mods);
+            let mut props2 = vk::FormatProperties2::default();
+            props2.p_next = &mut list as *mut _ as *mut std::os::raw::c_void;
+            self.instance
+                .get_physical_device_format_properties2(self.physical_device, format, &mut props2);
+
+            mods
+        }
+    }
+
+    /// For each format, keep only the modifiers that both the compositor
+    /// (Wayland) and this physical device (Vulkan) support, attaching the
+    /// Vulkan properties, and preserving the Wayland modifier order.
+    fn compute_intersection(&self, formats: &mut [DrmFormatInfo]) {
+        for fmt in formats.iter_mut() {
+            let vk_format = drm_fourcc_to_vk(fmt.code);
+            let vulkan = self.vulkan_modifiers(vk_format);
+            fmt.available = fmt
+                .wayland_modifiers
+                .iter()
+                .filter_map(|modifier| {
+                    vulkan
+                        .iter()
+                        .find(|m| m.drm_format_modifier == *modifier)
+                        .copied()
+                })
+                .collect();
+        }
+    }
+
+    /// Print each format together with its Wayland and Vulkan properties, but
+    /// only for formats available (supported) on both sides.
+    fn print_formats(&self, formats: &[DrmFormatInfo]) {
+        println!("DRM formats supported by both Wayland and Vulkan:");
+        for fmt in formats {
+            if fmt.available.is_empty() {
+                continue;
+            }
+            println!("format={}", fmt.code);
+            println!("  wayland modifiers: {:016x?}", fmt.wayland_modifiers);
+            for m in &fmt.available {
+                println!(
+                    "  vulkan modifier={:016x} planes={} tiling={:?}",
+                    m.drm_format_modifier, m.drm_format_modifier_plane_count, m.drm_format_modifier_tiling_features
+                );
+            }
         }
     }
 
@@ -620,7 +801,10 @@ fn create_device(
             .queue_family_index(queue_family)
             .queue_priorities(&priority);
 
-        let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+        let device_extensions = [
+            ash::khr::swapchain::NAME.as_ptr(),
+            vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr(),
+        ];
 
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
@@ -629,6 +813,22 @@ fn create_device(
         instance
             .create_device(physical_device, &create_info, None)
             .map_err(|e| format!("create device: {e}"))
+    }
+}
+
+/// Map a DRM_FORMAT fourcc to the best-matching linear Vulkan format, so we
+/// can query a physical device's supported modifiers for that format.
+fn drm_fourcc_to_vk(fourcc: DrmFourcc) -> vk::Format {
+    match fourcc {
+        // XRGB8888 / ARGB8888 -> byte order B, G, R, X/A
+        DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
+        // XBGR8888 / ABGR8888 -> byte order R, G, B, X/A
+        DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => vk::Format::R8G8B8A8_UNORM,
+        // RGB565
+        DrmFourcc::Rgb565 => vk::Format::R5G6B5_UNORM_PACK16,
+        // NV12 (semi-planar YUV 4:2:0)
+        DrmFourcc::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+        _ => vk::Format::UNDEFINED,
     }
 }
 
@@ -764,13 +964,41 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, AppData> f
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // The main_device event reports the compositor's preferred DRM device,
-        // whose dev_t is serialized into the byte array.
-        if let zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } = event {
-            let mut bytes = [0u8; 8];
-            let n = device.len().min(8);
-            bytes[..n].copy_from_slice(&device[..n]);
-            state.main_device = Some(u64::from_le_bytes(bytes));
+        match event {
+            // The main_device event reports the compositor's preferred DRM
+            // device, whose dev_t is serialized into the byte array.
+            zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } => {
+                let mut bytes = [0u8; 8];
+                let n = device.len().min(8);
+                bytes[..n].copy_from_slice(&device[..n]);
+                state.main_device = Some(u64::from_le_bytes(bytes));
+            }
+            // The compositor's packed format + modifier table as a mapped fd.
+            zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } => {
+                state.format_table = DrmFormatTable::map(fd, size);
+            }
+            // Each tranche_formats event carries u16 indices into the table;
+            // look each up to collect the (format, modifier) pairs.
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+                // Collect (code, modifier) pairs while the table is borrowed,
+                // then update state once the borrow is released.
+                let mut pairs: Vec<(DrmFourcc, u64)> = Vec::new();
+                if let Some(table) = &state.format_table {
+                    // Decode the packed u16 index array with zero-copy parsing.
+                    for pair in indices.chunks_exact(2) {
+                        let Ok(idx) = u16::ref_from_bytes(pair) else { continue };
+                        if let Some((format, modifier)) = table.get(*idx as usize)
+                            && let Ok(code) = DrmFourcc::try_from(format)
+                        {
+                            pairs.push((code, modifier));
+                        }
+                    }
+                }
+                for (code, modifier) in pairs {
+                    state.add_wayland_modifier(code, modifier);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -859,6 +1087,9 @@ fn main() {
         dmabuf: None,
         feedback: None,
         main_device: None,
+        format_table: None,
+        dmabuf_formats: Vec::new(),
+        modifiers_printed: false,
         size: (WINDOW_WIDTH, WINDOW_HEIGHT),
         vk: None,
         _surface_ptr: None,
