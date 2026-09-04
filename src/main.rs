@@ -5,7 +5,6 @@ use std::os::unix::io::{AsFd, FromRawFd, OwnedFd};
 use ash::vk;
 use ash::{Entry, Instance};
 use drm_fourcc::DrmFourcc;
-use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_buffer, wl_compositor, wl_registry, wl_surface};
 use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -1227,7 +1226,3 @@ fn main() {
             .expect("error dispatching Wayland events");
     }
 }
-
-// Keep ObjectId in scope for potential future use.
-#[allow(dead_code)]
-fn _assert_objectid(_: ObjectId) {}
