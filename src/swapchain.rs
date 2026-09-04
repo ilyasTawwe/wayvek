@@ -1,30 +1,15 @@
-use std::os::unix::io::OwnedFd;
+use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS};
 
-use ash::vk;
-
-use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS, open_render_node};
-use crate::renderer::vulkan::Vulkan;
-use crate::{DmaFrame, ExplicitSync};
-
-/// The Swapchain owns and drives the DRM syncobj timeline (`DrmSyncobj`) and
-/// coordinates the double-buffered DMA-BUF slots between the Vulkan Renderer
-/// and the Wayland backend.
+/// The Swapchain is responsible only for the double-buffered DMA-BUF slots: it
+/// tracks which slot is current and records each slot's release point so it can
+/// apply backpressure (throttling via release-point waits) before reusing a
+/// slot.
 ///
-/// Responsibilities:
-/// - Own the DRM syncobj timeline, exported once for the compositor's
-///   one-shot import (`wp_linux_drm_syncobj_manager_v1.import_timeline`).
-/// - Rotate the double-buffered slots and apply backpressure (throttling via
-///   release-point waits) before reusing a slot.
-/// - Bridge each frame's Vulkan sync-file onto the timeline, producing the
-///   (acquire, release) points the Wayland backend applies at commit time.
-///
-/// The timeline mechanics themselves live in [`crate::drm::DrmSyncobj`]; the
-/// Swapchain delegates to it rather than re-implementing syncobj ioctls.
-///
-/// The Swapchain does not own the Renderer — it receives it by mutable
-/// reference, keeping the modules decoupled.
+/// It does not own the DRM syncobj timeline nor the Vulkan renderer — those
+/// are owned by the caller (main), which passes the [`DrmSyncobj`] in so the
+/// swapchain can wait on buffer release. Drawing and sync-file bridging are the
+/// caller's responsibility.
 pub struct Swapchain {
-    drm_sync: DrmSyncobj,
     /// Release point for each buffer slot, set after the first presentation.
     release_points: [Option<u64>; 2],
     /// Which buffer slot we are currently using (0 or 1).
@@ -34,39 +19,18 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new(main_device: u64) -> std::io::Result<Self> {
-        let fd = open_render_node(main_device)?;
-        let drm_sync = DrmSyncobj::create(fd)?;
-        Ok(Self {
-            drm_sync,
+    pub fn new() -> Self {
+        Self {
             release_points: [None, None],
             current_idx: 0,
             presented: [false, false],
-        })
+        }
     }
 
-    /// Export the DRM syncobj timeline fd so the compositor can import it once
-    /// via `wp_linux_drm_syncobj_manager_v1.import_timeline`.
-    pub fn timeline_fd(&self) -> std::io::Result<OwnedFd> {
-        self.drm_sync.export_fd()
-    }
-
-    /// Produce the next frame: wait on backpressure, ask the Renderer to draw,
-    /// and bridge the resulting sync-file to the DRM syncobj timeline.
-    ///
-    /// The caller provides a `record` closure that receives the device,
-    /// command buffer, and image handle to record GPU commands
-    /// (see [`Vulkan::draw`]).
-    ///
-    /// Returns the DMA-BUF frame metadata and the explicit synchronization
-    /// points for the Wayland backend to apply at commit time.
-    pub fn next_frame(
-        &mut self,
-        renderer: &mut Vulkan,
-        width: u32,
-        height: u32,
-        record: impl FnOnce(usize, ash::Device, vk::CommandBuffer, vk::Image),
-    ) -> Result<(DmaFrame, ExplicitSync), String> {
+    /// Acquire the next buffer slot. If the slot was previously presented it
+    /// waits for the compositor to release it (via the caller-owned
+    /// `drm_sync` timeline) before returning the slot index.
+    pub fn acquire(&mut self, drm_sync: &DrmSyncobj) -> Result<usize, String> {
         // 1. Rotate buffer slot.
         self.current_idx = (self.current_idx + 1) % 2;
 
@@ -77,34 +41,24 @@ impl Swapchain {
         if self.presented[self.current_idx]
             && let Some(release_point) = self.release_points[self.current_idx]
         {
-            self.drm_sync
+            drm_sync
                 .wait_available(release_point, WAIT_RELEASE_TIMEOUT_NS)
                 .map_err(|e| format!("buffer reuse wait: {e}"))?;
         }
 
-        // 3. Production: ask the Renderer to draw into the current buffer.
-        let (frame, sync_file) = renderer.draw(self.current_idx, width, height, record)?;
+        Ok(self.current_idx)
+    }
 
-        // 4. Sync logic: import the Vulkan completion fence (sync-file) into
-        //    the DRM syncobj timeline. The compositor waits on the returned
-        //    acquire point before sampling the buffer, and signals the
-        //    following release point when it is done with it.
-        let acquire_point = self
-            .drm_sync
-            .import_sync_file(&sync_file)
-            .map_err(|e| format!("import sync-file: {e}"))?;
-        let release_point = acquire_point + 1;
+    /// Record the release point for a slot once it has been presented, so the
+    /// next `acquire` of that slot can wait for it.
+    pub fn mark_presented(&mut self, slot: usize, release_point: u64) {
+        self.release_points[slot] = Some(release_point);
+        self.presented[slot] = true;
+    }
+}
 
-        // 5. Track release point for the next reuse of this buffer slot.
-        self.release_points[self.current_idx] = Some(release_point);
-        self.presented[self.current_idx] = true;
-
-        Ok((
-            frame,
-            ExplicitSync {
-                acquire_point,
-                release_point,
-            },
-        ))
+impl Default for Swapchain {
+    fn default() -> Self {
+        Self::new()
     }
 }
