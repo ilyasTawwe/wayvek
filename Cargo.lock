@@ -234,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "drm-fourcc",
+ "libc",
  "rustix",
  "wayland-client",
  "wayland-protocols",

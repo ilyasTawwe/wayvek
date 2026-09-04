@@ -1,14 +1,19 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
-use std::os::unix::io::{AsFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 use ash::vk;
 use ash::{Entry, Instance};
 use drm_fourcc::DrmFourcc;
 use wayland_client::protocol::{wl_buffer, wl_compositor, wl_registry, wl_surface};
-use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
+    wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
+    wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+    wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
 };
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
@@ -18,6 +23,226 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 use rustix::fs::{major, minor};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use zerocopy::FromBytes;
+
+// ---------------- DRM syncobj (linux_drm_syncobj explicit sync) -----------
+// The compositor (via wp_linux_drm_syncobj_manager_v1) imports a client's DRM
+// syncobj timeline; the client attaches its rendering-completion sync-file onto
+// a timeline point, then tells the compositor the (acquire, release) points via
+// set_acquire_point/set_release_point at commit time. Mirrors egl-wayland2's
+// wayland-timeline.c.
+
+const DRM_IOCTL_BASE: u32 = 0x64; // 'd'
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
+const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE: u32 = 1 << 1;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+
+const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> libc::c_ulong {
+    ((dir as libc::c_ulong) << 30)
+        | ((ty as libc::c_ulong) << 8)
+        | (nr as libc::c_ulong)
+        | ((size as libc::c_ulong) << 16)
+}
+const fn iowr(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
+    ioc(3, ty, nr, size) // _IOC_READ | _IOC_WRITE
+}
+const DRM_IOCTL_SYNCOBJ_CREATE: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xBF, 8);
+const DRM_IOCTL_SYNCOBJ_DESTROY: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC0, 8);
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC1, 24);
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xC2, 24);
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xCA, 48);
+const DRM_IOCTL_SYNCOBJ_TRANSFER: libc::c_ulong = iowr(DRM_IOCTL_BASE, 0xCC, 32);
+
+/// How long to wait for the compositor to release a buffer (10s) before giving
+/// up and reusing it anyway. The compositor should signal promptly.
+const WAIT_RELEASE_TIMEOUT_NS: i64 = 10_000_000_000;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DrmSyncobjCreate {
+    handle: u32,
+    flags: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DrmSyncobjDestroy {
+    handle: u32,
+    pad: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DrmSyncobjHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+    pad: u32,
+    point: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DrmSyncobjTransfer {
+    src_handle: u32,
+    dst_handle: u32,
+    src_point: u64,
+    dst_point: u64,
+    flags: u32,
+    pad: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DrmSyncobjTimelineWait {
+    handles: u64,
+    points: u64,
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+    deadline_nsec: u64,
+}
+
+unsafe fn drm_ioctl<T>(fd: &OwnedFd, request: libc::c_ulong, data: &mut T) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            request,
+            data as *mut T as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// A DRM syncobj *timeline* created on the render node and shared with the
+/// compositor. The `handle` is the client's view; `import_timeline` gives the
+/// compositor an fd to the same underlying timeline.
+struct DrmSyncobj {
+    fd: OwnedFd,
+    handle: u32,
+    /// Last timeline point our rendering fence was attached to (the acquire
+    /// point of the most recent commit).
+    point: u64,
+    /// Release point of the most recent commit: the point the compositor will
+    /// signal when it is done with the buffer. We wait on it before reusing.
+    pending_release: Option<u64>,
+}
+
+impl DrmSyncobj {
+    fn create(fd: OwnedFd) -> std::io::Result<Self> {
+        let mut create = DrmSyncobjCreate {
+            handle: 0,
+            flags: 0,
+        };
+        unsafe { drm_ioctl(&fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut create)? };
+        Ok(Self {
+            fd,
+            handle: create.handle,
+            point: 0,
+            pending_release: None,
+        })
+    }
+
+    /// Export an fd for `wp_linux_drm_syncobj_manager_v1.import_timeline`.
+    /// The returned fd is a dup; the caller (or libwayland) owns it.
+    fn import_handle_fd(&self) -> std::io::Result<OwnedFd> {
+        let mut hand = DrmSyncobjHandle {
+            handle: self.handle,
+            flags: DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE,
+            fd: -1,
+            ..Default::default()
+        };
+        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut hand)? };
+        if hand.fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "syncobj HANDLE_TO_FD gave no fd",
+            ));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(hand.fd) })
+    }
+
+    /// Import a sync-file fd (the Vulkan fence) into a temporary syncobj and
+    /// transfer its fence onto our timeline at the next point. Returns the
+    /// acquire point for this commit (the point where our fence now lives), and
+    /// records the following point as the release point to wait on for reuse.
+    fn attach_sync_file(&mut self, syncfile_fd: &OwnedFd) -> std::io::Result<u64> {
+        let acquire_point = self.point + 1;
+
+        // Create a throwaway binary syncobj to receive the imported sync-file.
+        let mut create = DrmSyncobjCreate { handle: 0, flags: 0 };
+        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut create)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("create temp syncobj: {e}")))? };
+
+        // Import the sync-file into that existing temp syncobj. The kernel
+        // resolves `handle` as the DESTINATION object for the import, so it must
+        // already exist (mirrors libdrm drmSyncobjImportSyncFile / egl-wayland2).
+        let mut import = DrmSyncobjHandle {
+            handle: create.handle,
+            flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+            fd: syncfile_fd.as_raw_fd(),
+            ..Default::default()
+        };
+        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut import)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("import sync-file fd_to_handle: {e}")))? };
+        let temp = create.handle;
+
+        // Transfer that syncobj's fence onto the timeline at the acquire point.
+        let mut transfer = DrmSyncobjTransfer {
+            src_handle: temp,
+            dst_handle: self.handle,
+            src_point: 0,
+            dst_point: acquire_point,
+            flags: 0,
+            pad: 0,
+        };
+        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &mut transfer)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("timeline transfer: {e}")))? };
+
+        let mut destroy = DrmSyncobjDestroy {
+            handle: temp,
+            pad: 0,
+        };
+        let _ = unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut destroy) };
+
+        // The compositor signals the next point when it is done with the buffer.
+        self.point = acquire_point;
+        self.pending_release = Some(acquire_point + 1);
+        Ok(acquire_point)
+    }
+
+    /// Block until the compositor has signalled the given release point, i.e.
+    /// it no longer needs the buffer we handed it. Returns immediately if the
+    /// point is already available.
+    fn wait_release(&self, point: u64, timeout_nsec: i64) -> std::io::Result<()> {
+        let mut handle = self.handle;
+        let mut point_val = point;
+        let mut wait = DrmSyncobjTimelineWait {
+            handles: &mut handle as *mut u32 as u64,
+            points: &mut point_val as *mut u64 as u64,
+            timeout_nsec,
+            count_handles: 1,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+            ..Default::default()
+        };
+        unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut wait) }
+    }
+}
+
+impl Drop for DrmSyncobj {
+    fn drop(&mut self) {
+        let mut destroy = DrmSyncobjDestroy {
+            handle: self.handle,
+            pad: 0,
+        };
+        let _ = unsafe { drm_ioctl(&self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut destroy) };
+    }
+}
 
 const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
@@ -135,6 +360,16 @@ struct State {
     params_pending: bool,
     // Size (in pixels) of the buffer currently being created, for attach.
     create_size: Option<(i32, i32)>,
+    // Explicit synchronization (wp_linux_drm_syncobj_v1): the compositor-side
+    // manager, the per-surface extension, and the imported timeline shared with
+    // our Vulkan DRM syncobj. These are mandatory (no fallback).
+    syncobj_manager: Option<WpLinuxDrmSyncobjManagerV1>,
+    surface_sync: Option<WpLinuxDrmSyncobjSurfaceV1>,
+    syncobj_timeline: Option<WpLinuxDrmSyncobjTimelineV1>,
+    // Timeline points (acquire, release) for the buffer currently being created;
+    // sent via set_acquire_point/set_release_point before the surface commit.
+    pending_acquire: Option<u64>,
+    pending_release: Option<u64>,
 }
 
 impl State {
@@ -165,6 +400,15 @@ impl State {
         self.xdg_surface = Some(xdg_surface);
         self.toplevel = Some(toplevel);
         self.decoration = decoration;
+
+        // Explicit synchronization is mandatory: associate a per-surface
+        // wp_linux_drm_syncobj_surface with our wl_surface. Its set_acquire_point
+        // and set_release_point requests are applied at the surface commit.
+        let (Some(manager), Some(surf)) = (&self.syncobj_manager, self.surface.as_ref()) else {
+            panic!("wp_linux_drm_syncobj_manager_v1 is not available");
+        };
+        let surface_sync = manager.get_surface(surf, qh, AppData);
+        self.surface_sync = Some(surface_sync);
 
         // Initial commit so the shell configures the window.
         surface.commit();
@@ -201,6 +445,22 @@ impl State {
             }
         }
 
+        // Import our DRM syncobj timeline into the compositor once so we can
+        // set acquire/release points on it. Explicit sync is mandatory.
+        if self.syncobj_timeline.is_none() {
+            let (Some(manager), Some(qh2)) = (&self.syncobj_manager.clone(), self.qh.clone())
+            else {
+                panic!("wp_linux_drm_syncobj_manager_v1 is not available");
+            };
+            let import_fd = self
+                .vk
+                .as_ref()
+                .and_then(|vk| vk.syncobj_import_fd())
+                .expect("no DRM syncobj to import");
+            let timeline = manager.import_timeline(import_fd.as_fd(), &qh2, AppData);
+            self.syncobj_timeline = Some(timeline);
+        }
+
         let (Some(dmabuf), Some(qh)) = (&self.dmabuf.clone(), self.qh.clone()) else {
             return;
         };
@@ -213,6 +473,12 @@ impl State {
                 return;
             }
         };
+
+        // The compositor waits on the acquire point before sampling the buffer
+        // and signals the release point when it is done; both are sent on the
+        // surface sync object at commit time (in the Created handler).
+        self.pending_acquire = Some(presented.acquire_point);
+        self.pending_release = Some(presented.release_point);
 
         // Wrap the exported dmabuf into a wl_buffer via linux-dmabuf params.
         let params = dmabuf.create_params(&qh, AppData);
@@ -281,7 +547,8 @@ struct DmaBuffer {
     planes: Vec<DmaPlane>,
 }
 
-/// A buffer handed to the Wayland layer to wrap in a wl_buffer.
+/// A buffer handed to the Wayland layer to wrap in a wl_buffer, together with
+/// the explicit-sync timeline points for this frame.
 struct PresentedBuffer {
     fd: OwnedFd,
     format_fourcc: u32,
@@ -289,6 +556,9 @@ struct PresentedBuffer {
     planes: Vec<DmaPlane>,
     width: i32,
     height: i32,
+    /// (acquire, release) timeline point for this frame's buffer.
+    acquire_point: u64,
+    release_point: u64,
 }
 
 struct Vulkan {
@@ -300,6 +570,10 @@ struct Vulkan {
     queue_family: u32,
     /// Exported-fd loader for VK_KHR_external_memory_fd.
     external_fd: ash::khr::external_memory_fd::Device,
+    /// Exported sync-file-fd loader for VK_KHR_external_fence_fd.
+    external_fence: ash::khr::external_fence_fd::Device,
+    /// DRM render node + syncobj timeline for linux_drm_syncobj explicit sync.
+    syncobj: Option<DrmSyncobj>,
     /// Format and modifier of the current buffer, and its size in pixels.
     vk_format: vk::Format,
     drm_format: u32,
@@ -328,6 +602,15 @@ impl Vulkan {
 
             let external_fd =
                 ash::khr::external_memory_fd::Device::new(&instance, &device);
+            let external_fence =
+                ash::khr::external_fence_fd::Device::new(&instance, &device);
+
+            // Open the DRM render node that backs this physical device (matched
+            // by major/minor) so we can create the syncobj timeline for explicit
+            // synchronization. Non-fatal: if it fails we fall back to implicit.
+            let syncobj = open_render_node(main_device)
+                .and_then(DrmSyncobj::create)
+                .ok();
 
             Ok(Self {
                 _entry: entry,
@@ -337,6 +620,8 @@ impl Vulkan {
                 queue,
                 queue_family,
                 external_fd,
+                external_fence,
+                syncobj,
                 vk_format: vk::Format::UNDEFINED,
                 drm_format: 0,
                 modifier: 0,
@@ -458,19 +743,20 @@ impl Vulkan {
                 self.create_buffer(width, height, drm_format, vk_format, modifier)?;
             }
 
+            // Explicit sync is mandatory: we reuse the single buffer, so before
+            // re-clearing it we must wait until the compositor has signalled the
+            // previous frame's release point (wl_buffer.release is undefined
+            // while the syncobj surface extension is live).
+            let syncobj = self.syncobj.as_ref().expect("no DRM syncobj");
+            if let Some(wait_point) = syncobj.pending_release {
+                syncobj
+                    .wait_release(wait_point, WAIT_RELEASE_TIMEOUT_NS)
+                    .map_err(|e| format!("wait for compositor release: {e}"))?;
+            }
+
             let frame = self.frame.as_mut().unwrap();
             let image = self.buffer.as_ref().unwrap().image;
             let command_buffer = frame.command_buffer;
-
-            // Wait for the previous frame's work so we can reuse the command
-            // buffer and safely rewrite the single buffer.
-            self.device
-                .wait_for_fences(
-                    std::slice::from_ref(&frame.fence),
-                    true,
-                    u64::MAX,
-                )
-                .map_err(|e| format!("wait for frame fence: {e}"))?;
 
             // Record a command buffer that clears the image to CLEAR_COLOR.
             let begin_info = vk::CommandBufferBeginInfo::default();
@@ -548,10 +834,25 @@ impl Vulkan {
                 .queue_submit(self.queue, std::slice::from_ref(&submit), frame.fence)
                 .map_err(|e| format!("queue submit: {e}"))?;
 
-            // Wait for the clear to be visible before handing the dmabuf over.
-            self.device
-                .wait_for_fences(std::slice::from_ref(&frame.fence), true, u64::MAX)
-                .map_err(|e| format!("wait for frame fence: {e}"))?;
+            // No CPU wait needed for the clear itself: we hand the compositor an
+            // explicit acquire fence via the syncobj timeline instead.
+            let get_fence_fd = vk::FenceGetFdInfoKHR::default()
+                .fence(frame.fence)
+                .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+            let syncfd = self
+                .external_fence
+                .get_fence_fd(&get_fence_fd)
+                .map_err(|e| format!("export fence fd: {e}"))?;
+            let syncfd = OwnedFd::from_raw_fd(syncfd);
+
+            // Attach our rendering fence onto the timeline. The compositor waits
+            // on the returned acquire point before sampling the buffer, and
+            // signals the following release point when it is done with it.
+            let syncobj = self.syncobj.as_mut().unwrap();
+            let acquire_point = syncobj
+                .attach_sync_file(&syncfd)
+                .map_err(|e| format!("attach sync-file to timeline: {e}"))?;
+            let release_point = acquire_point + 1;
 
             // Hand the consumer a dup of the fd; the buffer keeps its own copy
             // for reuse on the next frame.
@@ -568,8 +869,16 @@ impl Vulkan {
                 planes: buffer.planes.clone(),
                 width: width as i32,
                 height: height as i32,
+                acquire_point,
+                release_point,
             })
         }
+    }
+
+    /// Export the DRM syncobj timeline fd so the compositor can import it via
+    /// `wp_linux_drm_syncobj_manager_v1.import_timeline`.
+    fn syncobj_import_fd(&self) -> Option<OwnedFd> {
+        self.syncobj.as_ref().and_then(|s| s.import_handle_fd().ok())
     }
 
     /// (Re)create the single drm-backed buffer at `width`x`height` using the
@@ -697,8 +1006,11 @@ impl Vulkan {
                     .device
                     .allocate_command_buffers(&alloc_info)
                     .map_err(|e| format!("allocate command buffer: {e}"))?;
+                let mut export_fence = vk::ExportFenceCreateInfo::default()
+                    .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
                 let fence_info = vk::FenceCreateInfo::default()
-                    .flags(vk::FenceCreateFlags::SIGNALED);
+                    .flags(vk::FenceCreateFlags::SIGNALED)
+                    .push_next(&mut export_fence);
                 let fence = self
                     .device
                     .create_fence(&fence_info, None)
@@ -843,6 +1155,19 @@ fn device_drm_matches(
     }
 }
 
+/// Open the DRM render node `/dev/dri/renderD<minor>` for the given dev_t, so
+/// we can drive syncobj ioctls on the same GPU as our Vulkan device.
+fn open_render_node(dev: u64) -> std::io::Result<OwnedFd> {
+    let (_, minor) = (major(dev), minor(dev));
+    rustix::fs::open(
+        format!("/dev/dri/renderD{minor}"),
+        rustix::fs::OFlags::RDWR,
+        rustix::fs::Mode::empty(),
+    )
+    .map(Into::into)
+    .map_err(std::io::Error::from)
+}
+
 fn create_device(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
@@ -857,6 +1182,7 @@ fn create_device(
         let device_extensions = [
             ash::khr::external_memory_fd::NAME.as_ptr(),
             ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+            ash::khr::external_fence_fd::NAME.as_ptr(),
             vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr(),
         ];
 
@@ -957,6 +1283,10 @@ impl Dispatch<wl_registry::WlRegistry, GlobalData> for State {
                     let feedback = proxy.get_default_feedback(qh, AppData);
                     state.dmabuf = Some(proxy);
                     state.feedback = Some(feedback);
+                }
+                "wp_linux_drm_syncobj_manager_v1" => {
+                    let proxy = registry.bind::<WpLinuxDrmSyncobjManagerV1, _, _>(name, 1, qh, AppData);
+                    state.syncobj_manager = Some(proxy);
                 }
                 _ => {}
             }
@@ -1077,6 +1407,18 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, AppData> for S
             zwp_linux_buffer_params_v1::Event::Created { buffer } => {
                 params.destroy();
                 if let Some(surface) = &state.surface {
+                    // Explicit sync: set the acquire/release timeline points that
+                    // apply to this commit, before attaching and committing.
+                    let (Some(surface_sync), Some(timeline)) =
+                        (&state.surface_sync, &state.syncobj_timeline)
+                    else {
+                        panic!("explicit sync objects missing");
+                    };
+                    let acquire = state.pending_acquire.take().expect("no pending acquire point");
+                    let release = state.pending_release.take().expect("no pending release point");
+                    surface_sync.set_acquire_point(timeline, (acquire >> 32) as u32, acquire as u32);
+                    surface_sync.set_release_point(timeline, (release >> 32) as u32, release as u32);
+
                     surface.attach(Some(&buffer), 0, 0);
                     let (w, h) = state.create_size.unwrap_or((0, 0));
                     surface.damage_buffer(0, 0, w, h);
@@ -1108,6 +1450,42 @@ impl Dispatch<wl_buffer::WlBuffer, AppData> for State {
         _state: &mut Self,
         _proxy: &wl_buffer::WlBuffer,
         _event: wl_buffer::Event,
+        _data: &AppData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjManagerV1, AppData> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpLinuxDrmSyncobjManagerV1,
+        _event: <WpLinuxDrmSyncobjManagerV1 as Proxy>::Event,
+        _data: &AppData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, AppData> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpLinuxDrmSyncobjSurfaceV1,
+        _event: <WpLinuxDrmSyncobjSurfaceV1 as Proxy>::Event,
+        _data: &AppData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjTimelineV1, AppData> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpLinuxDrmSyncobjTimelineV1,
+        _event: <WpLinuxDrmSyncobjTimelineV1 as Proxy>::Event,
         _data: &AppData,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
@@ -1205,6 +1583,11 @@ fn main() {
         qh: Some(qh.clone()),
         params_pending: false,
         create_size: None,
+        syncobj_manager: None,
+        surface_sync: None,
+        syncobj_timeline: None,
+        pending_acquire: None,
+        pending_release: None,
     };
 
     // Roundtrip once to read the globals and create the window.
