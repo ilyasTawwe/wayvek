@@ -55,11 +55,11 @@ pub struct ExplicitSync {
 ///   for a given DRM fourcc code.
 pub fn negotiate(
     advertised: &[(u32, Vec<u64>)],
-    vulan_mods: impl Fn(u32) -> Vec<u64>,
+    vulkan_mods: impl Fn(u32) -> Vec<u64>,
 ) -> Option<(u32, u64)> {
     // First pass: prefer a non-linear, non-INVALID modifier.
     for &(fourcc, ref wl_mods) in advertised {
-        let vk_mods = vulan_mods(fourcc);
+        let vk_mods = vulkan_mods(fourcc);
         for &modifier in wl_mods {
             if vk_mods.contains(&modifier) && modifier != 0 && modifier != DRM_FORMAT_MODIFIER_INVALID
             {
@@ -69,7 +69,7 @@ pub fn negotiate(
     }
     // Second pass: fall back to linear (modifier 0) if nothing else works.
     for &(fourcc, ref wl_mods) in advertised {
-        let vk_mods = vulan_mods(fourcc);
+        let vk_mods = vulkan_mods(fourcc);
         for &modifier in wl_mods {
             if vk_mods.contains(&modifier) {
                 return Some((fourcc, modifier));

@@ -2,7 +2,7 @@ use wayland_client::Connection;
 
 use wayvek::backend::wayland::WaylandState;
 use wayvek::negotiate;
-use wayvek::renderer::vulkan::{Vulkan, drm_fourcc_to_vk};
+use wayvek::renderer::vulkan::Vulkan;
 use wayvek::swapchain::Swapchain;
 
 fn main() {
@@ -37,7 +37,6 @@ fn main() {
     let (fourcc, modifier) =
         negotiate(&advertised, |f| renderer.get_supported_modifiers(f))
             .expect("no mutually supported DRM format");
-    let _vk_format = drm_fourcc_to_vk(drm_fourcc::DrmFourcc::try_from(fourcc).unwrap());
     renderer.set_buffer_format(fourcc, modifier);
 
     eprintln!("chose format={fourcc} modifier={modifier:016x}");
