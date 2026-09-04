@@ -6,10 +6,20 @@ use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS, open_render_node};
 use crate::renderer::vulkan::Vulkan;
 use crate::{DmaFrame, ExplicitSync};
 
-/// The Swapchain coordinates between the Vulkan Renderer and the DRM syncobj
-/// Timeline. It manages double-buffered DMA-BUF slots, handles backpressure
-/// (throttling via release-point waits), and bridges the Vulkan sync-file to
-/// the DRM syncobj timeline.
+/// The Swapchain owns and drives the DRM syncobj timeline (`DrmSyncobj`) and
+/// coordinates the double-buffered DMA-BUF slots between the Vulkan Renderer
+/// and the Wayland backend.
+///
+/// Responsibilities:
+/// - Own the DRM syncobj timeline, exported once for the compositor's
+///   one-shot import (`wp_linux_drm_syncobj_manager_v1.import_timeline`).
+/// - Rotate the double-buffered slots and apply backpressure (throttling via
+///   release-point waits) before reusing a slot.
+/// - Bridge each frame's Vulkan sync-file onto the timeline, producing the
+///   (acquire, release) points the Wayland backend applies at commit time.
+///
+/// The timeline mechanics themselves live in [`crate::drm::DrmSyncobj`]; the
+/// Swapchain delegates to it rather than re-implementing syncobj ioctls.
 ///
 /// The Swapchain does not own the Renderer — it receives it by mutable
 /// reference, keeping the modules decoupled.
@@ -35,8 +45,8 @@ impl Swapchain {
         })
     }
 
-    /// Export the DRM syncobj timeline fd so the compositor can import it via
-    /// `wp_linux_drm_syncobj_manager_v1.import_timeline`.
+    /// Export the DRM syncobj timeline fd so the compositor can import it once
+    /// via `wp_linux_drm_syncobj_manager_v1.import_timeline`.
     pub fn timeline_fd(&self) -> std::io::Result<OwnedFd> {
         self.drm_sync.export_fd()
     }
@@ -89,16 +99,9 @@ impl Swapchain {
         self.release_points[self.current_idx] = Some(release_point);
         self.presented[self.current_idx] = true;
 
-        // 6. Export the timeline fd for the Wayland backend.
-        let timeline_fd = self
-            .drm_sync
-            .export_fd()
-            .map_err(|e| format!("export timeline fd: {e}"))?;
-
         Ok((
             frame,
             ExplicitSync {
-                timeline_fd,
                 acquire_point,
                 release_point,
             },

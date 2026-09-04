@@ -35,11 +35,13 @@ pub struct DmaFrame {
 /// Explicit synchronization information for a single frame. The Wayland
 /// backend applies these timeline points via wp_linux_drm_syncobj_surface_v1
 /// at surface commit time.
+///
+/// The DRM syncobj timeline itself is owned by [`crate::swapchain::Swapchain`]
+/// (wrapping a [`crate::drm::DrmSyncobj`]) and is imported into the compositor
+/// once at startup via `wp_linux_drm_syncobj_manager_v1.import_timeline`. Thus
+/// only the acquire/release points travel per-frame.
 #[derive(Debug)]
 pub struct ExplicitSync {
-    /// DRM syncobj timeline fd, imported once into the compositor via
-    /// wp_linux_drm_syncobj_manager_v1.import_timeline.
-    pub timeline_fd: OwnedFd,
     /// Point the compositor waits on before sampling the buffer.
     pub acquire_point: u64,
     /// Point the compositor signals when it is done with the buffer.
