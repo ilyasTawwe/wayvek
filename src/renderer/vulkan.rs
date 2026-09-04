@@ -43,15 +43,11 @@ pub struct Vulkan {
     queue_family: u32,
     external_fd: ash::khr::external_memory_fd::Device,
     external_fence: ash::khr::external_fence_fd::Device,
-    vk_format: vk::Format,
-    drm_format: u32,
-    modifier: u64,
+    buffer_fmt: Option<(u32, vk::Format, u64)>,
     extent: vk::Extent2D,
     command_pool: vk::CommandPool,
     frame: Option<FrameData>,
     buffers: [Option<DmaBuffer>; 2],
-    current_idx: usize,
-    buffer_fmt: Option<(u32, vk::Format, u64)>,
 }
 
 impl Vulkan {
@@ -83,15 +79,11 @@ impl Vulkan {
                 queue_family,
                 external_fd,
                 external_fence,
-                vk_format: vk::Format::UNDEFINED,
-                drm_format: 0,
-                modifier: 0,
+                buffer_fmt: None,
                 extent: vk::Extent2D::default(),
                 command_pool: vk::CommandPool::null(),
                 frame: None,
                 buffers: [None, None],
-                current_idx: 0,
-                buffer_fmt: None,
             })
         }
     }
@@ -120,9 +112,6 @@ impl Vulkan {
         };
         let vk_format = drm_fourcc_to_vk(code);
         self.buffer_fmt = Some((fourcc, vk_format, modifier));
-        self.drm_format = fourcc;
-        self.vk_format = vk_format;
-        self.modifier = modifier;
     }
 
     /// Render a cleared frame into the current DMA-backed buffer and return
@@ -131,7 +120,7 @@ impl Vulkan {
     /// This method is purely GPU-side: it has no knowledge of Wayland protocols
     /// or DRM syncobj timelines. The caller (Swapchain) is responsible for
     /// backpressure (waiting on buffer release) and timeline synchronization.
-    pub fn draw(&mut self, width: u32, height: u32) -> Result<(DmaFrame, OwnedFd), String> {
+    pub fn draw(&mut self, slot: usize, width: u32, height: u32) -> Result<(DmaFrame, OwnedFd), String> {
         // SAFETY: this block invokes Vulkan command-buffer recording, queue
         // submission, and fd export. All Vulkan handles are valid (created in
         // `new`/`create_buffer`); errors are propagated via `map_err(..)?`.
@@ -147,16 +136,13 @@ impl Vulkan {
 
             let (drm_format, vk_format, modifier) = self.buffer_fmt.ok_or("no DRM format")?;
 
-            // 2. Rotate buffers (Double Buffering).
-            self.current_idx = (self.current_idx + 1) % 2;
-
-            // 3. Lazily create the buffer for this slot.
-            if self.buffers[self.current_idx].is_none() {
-                self.buffers[self.current_idx] =
-                    Some(self.create_buffer(width, height, drm_format, vk_format, modifier)?);
+            // 2. Lazily create the buffer for this slot.
+            if self.buffers[slot].is_none() {
+                self.buffers[slot] =
+                    Some(self.create_buffer(width, height, vk_format, modifier)?);
             }
 
-            let buf = self.buffers[self.current_idx]
+            let buf = self.buffers[slot]
                 .as_ref()
                 .ok_or("buffer slot was not created")?;
 
@@ -320,7 +306,6 @@ impl Vulkan {
         &mut self,
         width: u32,
         height: u32,
-        drm_format: u32,
         vk_format: vk::Format,
         modifier: u64,
     ) -> Result<DmaBuffer, String> {
@@ -398,10 +383,6 @@ impl Vulkan {
                 stride: layout.row_pitch,
             }];
 
-            self.vk_format = vk_format;
-            self.drm_format = drm_format;
-            self.modifier = modifier;
-            self.buffer_fmt = Some((drm_format, vk_format, modifier));
             self.extent = extent;
 
             // Set up the (single) frame command buffer + fence on first use.

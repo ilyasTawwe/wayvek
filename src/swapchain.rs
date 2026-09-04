@@ -1,6 +1,6 @@
 use std::os::unix::io::OwnedFd;
 
-use crate::backend::drm_sync::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS, open_render_node};
+use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS, open_render_node};
 use crate::renderer::vulkan::Vulkan;
 use crate::{DmaFrame, ExplicitSync};
 
@@ -66,7 +66,7 @@ impl Swapchain {
         }
 
         // 3. Production: ask the Renderer to draw into the current buffer.
-        let (frame, sync_file) = renderer.draw(width, height)?;
+        let (frame, sync_file) = renderer.draw(self.current_idx, width, height)?;
 
         // 4. Sync logic: import the Vulkan completion fence (sync-file) into
         //    the DRM syncobj timeline. The compositor waits on the returned

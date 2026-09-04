@@ -1,6 +1,7 @@
 use std::os::unix::io::OwnedFd;
 
 pub mod backend;
+pub mod drm;
 pub mod renderer;
 pub mod swapchain;
 
