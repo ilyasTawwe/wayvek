@@ -240,6 +240,7 @@ name = "wayvek"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "rustix",
  "wayland-client",
  "wayland-protocols",
 ]

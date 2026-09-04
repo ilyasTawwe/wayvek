@@ -7,3 +7,4 @@ edition = "2024"
 wayland-client = { version = "0.31.15", features = ["dlopen", "system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
 ash = "0.38.0"
+rustix = { version = "1", features = ["fs"] }

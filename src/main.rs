@@ -14,6 +14,8 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
+use rustix::fs::{major, minor};
+
 const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
 
@@ -35,7 +37,7 @@ struct State {
     // from the linux-dmabuf feedback. Used to select the matching Vulkan GPU.
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     feedback: Option<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>,
-    main_device: Option<(i64, i64)>,
+    main_device: Option<u64>,
     // Current window size in surface coordinates.
     size: (u32, u32),
     // Vulkan renderer, initialized once the surface + size are known.
@@ -92,7 +94,7 @@ impl State {
             let surface_ptr = surface.id().as_ptr() as *mut vk::wl_surface;
             self._surface_ptr = Some(surface_ptr);
             let display_ptr = *display_ptr;
-            let main_device = self.main_device;
+            let main_device = self.main_device.unwrap();
             match Vulkan::new(display_ptr, surface_ptr, main_device) {
                 Ok(vk) => self.vk = Some(vk),
                 Err(e) => {
@@ -144,7 +146,7 @@ impl Vulkan {
     fn new(
         display_ptr: *mut vk::wl_display,
         surface_ptr: *mut vk::wl_surface,
-        main_device: Option<(i64, i64)>,
+        main_device: u64,
     ) -> Result<Self, String> {
         unsafe {
             let entry = Entry::load().map_err(|e| e.to_string())?;
@@ -541,38 +543,27 @@ fn pick_physical_device(
     instance: &Instance,
     surface_fn: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
-    main_device: Option<(i64, i64)>,
+    dev: u64,
 ) -> Result<(vk::PhysicalDevice, u32), String> {
+    let (major, minor) = (major(dev), minor(dev));
     unsafe {
         let devices = instance
             .enumerate_physical_devices()
             .map_err(|e| format!("enumerate physical devices: {e}"))?;
 
-        // First pass: prefer the physical device whose DRM node matches the
-        // compositor's main device (from the linux-dmabuf feedback).
-        if let Some((major, minor)) = main_device {
-            for device in &devices {
-                let (q, name) =
-                    match find_queue_family(instance, surface_fn, surface, *device) {
-                        Some(x) => x,
-                        None => continue,
-                    };
-                if device_drm_matches(instance, *device, major, minor) {
-                    eprintln!("using main GPU: {name}");
-                    return Ok((*device, q));
-                }
+        for device in &devices {
+            let (q, name) =
+                match find_queue_family(instance, surface_fn, surface, *device) {
+                    Some(x) => x,
+                    None => continue,
+                };
+            if device_drm_matches(instance, *device, major, minor) {
+                eprintln!("using main GPU: {name}");
+                return Ok((*device, q));
             }
-            eprintln!("no Vulkan device matched main DRM {major}:{minor}");
         }
 
-        // Fallback: any device with a suitable graphics+present queue family.
-        for device in devices {
-            if let Some((q, name)) = find_queue_family(instance, surface_fn, surface, device) {
-                eprintln!("using GPU: {name}");
-                return Ok((device, q));
-            }
-        }
-        Err("no suitable physical device".into())
+        Err(format!("no Vulkan device matched main DRM {major}:{minor}"))
     }
 }
 
@@ -605,8 +596,8 @@ fn find_queue_family(
 fn device_drm_matches(
     instance: &Instance,
     device: vk::PhysicalDevice,
-    major: i64,
-    minor: i64,
+    major: u32,
+    minor: u32,
 ) -> bool {
     unsafe {
         let mut props2 = vk::PhysicalDeviceProperties2::default();
@@ -614,32 +605,8 @@ fn device_drm_matches(
         props2.p_next = &mut drm as *mut _ as *mut std::os::raw::c_void;
         instance.get_physical_device_properties2(device, &mut props2);
 
-        if drm.has_primary != vk::TRUE && drm.has_render != vk::TRUE {
-            return false;
-        }
-        (drm.has_primary == vk::TRUE
-            && drm.primary_major == major
-            && drm.primary_minor == minor)
-            || (drm.has_render == vk::TRUE
-                && drm.render_major == major
-                && drm.render_minor == minor)
+        drm.has_render == vk::TRUE && drm.render_major as u32 == major && drm.render_minor as u32 == minor
     }
-}
-
-/// Decode a dev_t serialized as raw bytes (the linux-dmabuf main_device event).
-fn decode_dev_t(data: &[u8]) -> Option<(i64, i64)> {
-    if data.is_empty() {
-        return None;
-    }
-    // The dev_t is an unsigned long; parse up to 8 bytes (little-endian).
-    let mut bytes = [0u8; 8];
-    let n = data.len().min(8);
-    bytes[..n].copy_from_slice(&data[..n]);
-    let dev = u64::from_le_bytes(bytes);
-
-    let major = ((dev >> 32) & 0xfffff) | ((dev >> 8) & 0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
-    Some((major as i64, minor as i64))
 }
 
 fn create_device(
@@ -799,10 +766,11 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, AppData> f
     ) {
         // The main_device event reports the compositor's preferred DRM device,
         // whose dev_t is serialized into the byte array.
-        if let zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } = event
-            && let Some((major, minor)) = decode_dev_t(&device)
-        {
-            state.main_device = Some((major, minor));
+        if let zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } = event {
+            let mut bytes = [0u8; 8];
+            let n = device.len().min(8);
+            bytes[..n].copy_from_slice(&device[..n]);
+            state.main_device = Some(u64::from_le_bytes(bytes));
         }
     }
 }
