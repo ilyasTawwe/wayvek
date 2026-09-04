@@ -102,6 +102,14 @@ impl State {
 
 // --------------------------- Ash rendering ------------------------------
 
+struct FrameData {
+    command_buffer: vk::CommandBuffer,
+    acquire_semaphore: vk::Semaphore,
+    render_semaphore: vk::Semaphore,
+    // Signalled once this frame's GPU work is done; waited on before reuse.
+    fence: vk::Fence,
+}
+
 struct Vulkan {
     _entry: Entry,
     instance: Instance,
@@ -118,9 +126,9 @@ struct Vulkan {
     format: vk::Format,
     extent: vk::Extent2D,
     command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    acquire_semaphore: vk::Semaphore,
-    render_semaphore: vk::Semaphore,
+    // One frame resource set per swapchain image (fence per image).
+    frames: Vec<FrameData>,
+    current_frame: usize,
 }
 
 impl Vulkan {
@@ -165,9 +173,8 @@ impl Vulkan {
                 format: vk::Format::UNDEFINED,
                 extent: vk::Extent2D::default(),
                 command_pool: vk::CommandPool::null(),
-                command_buffer: vk::CommandBuffer::null(),
-                acquire_semaphore: vk::Semaphore::null(),
-                render_semaphore: vk::Semaphore::null(),
+                frames: Vec::new(),
+                current_frame: 0,
             })
         }
     }
@@ -183,27 +190,34 @@ impl Vulkan {
                 self.create_swapchain(width, height)?;
             }
 
-            // Wait for the previous frame's GPU work to finish so the semaphores
-            // are free to reuse. Rendering is event-driven and infrequent, so a
-            // full idle wait is acceptable.
-            self.device.queue_wait_idle(self.queue).unwrap();
+            // Round-robin through the per-image frame resource sets. Wait until
+            // this frame's fence is signalled before reusing its resources.
+            let frame = &self.frames[self.current_frame % self.frames.len()];
+            self.device
+                .wait_for_fences(
+                    std::slice::from_ref(&frame.fence),
+                    true,
+                    u64::MAX,
+                )
+                .map_err(|e| format!("wait for frame fence: {e}"))?;
 
             let (image_index, _suboptimal) = self
                 .swapchain
                 .acquire_next_image(
                     self.swapchain_khr,
                     u64::MAX,
-                    self.acquire_semaphore,
+                    frame.acquire_semaphore,
                     vk::Fence::null(),
                 )
                 .map_err(|e| format!("acquire next image: {e}"))?;
 
             let image = self.images[image_index as usize];
+            let command_buffer = frame.command_buffer;
 
             // Record a command buffer that clears the image to CLEAR_COLOR.
             let begin_info = vk::CommandBufferBeginInfo::default();
             self.device
-                .begin_command_buffer(self.command_buffer, &begin_info)
+                .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| format!("begin command buffer: {e}"))?;
 
             let subresource = vk::ImageSubresourceRange::default()
@@ -221,7 +235,7 @@ impl Vulkan {
                 .subresource_range(subresource)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             self.device.cmd_pipeline_barrier(
-                self.command_buffer,
+                command_buffer,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
@@ -236,7 +250,7 @@ impl Vulkan {
                 .level_count(1)
                 .layer_count(1);
             self.device.cmd_clear_color_image(
-                self.command_buffer,
+                command_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &clear_value,
@@ -253,7 +267,7 @@ impl Vulkan {
                 .subresource_range(subresource)
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             self.device.cmd_pipeline_barrier(
-                self.command_buffer,
+                command_buffer,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
@@ -263,29 +277,31 @@ impl Vulkan {
             );
 
             self.device
-                .end_command_buffer(self.command_buffer)
+                .end_command_buffer(command_buffer)
                 .map_err(|e| format!("end command buffer: {e}"))?;
 
             // Wait for acquire, submit, signal render.
+            self.device
+                .reset_fences(std::slice::from_ref(&frame.fence))
+                .map_err(|e| format!("reset fence: {e}"))?;
+
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let submit = vk::SubmitInfo::default()
-                .wait_semaphores(std::slice::from_ref(&self.acquire_semaphore))
+                .wait_semaphores(std::slice::from_ref(&frame.acquire_semaphore))
                 .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(std::slice::from_ref(&self.command_buffer))
-                .signal_semaphores(std::slice::from_ref(&self.render_semaphore));
+                .command_buffers(std::slice::from_ref(&command_buffer))
+                .signal_semaphores(std::slice::from_ref(&frame.render_semaphore));
             self.device
-                .queue_submit(
-                    self.queue,
-                    std::slice::from_ref(&submit),
-                    vk::Fence::null(),
-                )
+                .queue_submit(self.queue, std::slice::from_ref(&submit), frame.fence)
                 .map_err(|e| format!("queue submit: {e}"))?;
 
             let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&self.render_semaphore))
+                .wait_semaphores(std::slice::from_ref(&frame.render_semaphore))
                 .swapchains(std::slice::from_ref(&self.swapchain_khr))
                 .image_indices(std::slice::from_ref(&image_index));
             let result = self.swapchain.queue_present(self.queue, &present);
+
+            self.current_frame += 1;
 
             // Out of date only means the swapchain must be recreated next time.
             match result {
@@ -391,7 +407,9 @@ impl Vulkan {
                 self.image_views.push(view);
             }
 
-            // One command buffer + semaphores for the (re)created swapchain.
+            // Allocate one frame resource set (command buffer, acquire/render
+            // semaphores, fence) per swapchain image.
+            let frame_count = self.images.len();
             if self.command_pool == vk::CommandPool::null() {
                 let pool_info = vk::CommandPoolCreateInfo::default()
                     .queue_family_index(self.queue_family)
@@ -400,31 +418,58 @@ impl Vulkan {
                     .device
                     .create_command_pool(&pool_info, None)
                     .map_err(|e| format!("create command pool: {e}"))?;
+            }
 
+            // Recreate frame resources if the image count changed.
+            if self.frames.len() != frame_count {
+                self.destroy_frames();
+                let sem_info = vk::SemaphoreCreateInfo::default();
+                let fence_info = vk::FenceCreateInfo::default()
+                    .flags(vk::FenceCreateFlags::SIGNALED);
                 let alloc_info = vk::CommandBufferAllocateInfo::default()
                     .command_pool(self.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1);
+                    .command_buffer_count(frame_count as u32);
                 let bufs = self
                     .device
                     .allocate_command_buffers(&alloc_info)
-                    .map_err(|e| format!("allocate command buffer: {e}"))?;
-                self.command_buffer = bufs[0];
-            }
-
-            if self.acquire_semaphore == vk::Semaphore::null() {
-                let sem_info = vk::SemaphoreCreateInfo::default();
-                self.acquire_semaphore = self
-                    .device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| format!("create acquire semaphore: {e}"))?;
-                self.render_semaphore = self
-                    .device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| format!("create render semaphore: {e}"))?;
+                    .map_err(|e| format!("allocate command buffers: {e}"))?;
+                for &cb in &bufs {
+                    let acquire = self
+                        .device
+                        .create_semaphore(&sem_info, None)
+                        .map_err(|e| format!("create acquire semaphore: {e}"))?;
+                    let render = self
+                        .device
+                        .create_semaphore(&sem_info, None)
+                        .map_err(|e| format!("create render semaphore: {e}"))?;
+                    let fence = self
+                        .device
+                        .create_fence(&fence_info, None)
+                        .map_err(|e| format!("create frame fence: {e}"))?;
+                    self.frames.push(FrameData {
+                        command_buffer: cb,
+                        acquire_semaphore: acquire,
+                        render_semaphore: render,
+                        fence,
+                    });
+                }
             }
 
             Ok(())
+        }
+    }
+
+    fn destroy_frames(&mut self) {
+        unsafe {
+            if self.command_pool == vk::CommandPool::null() {
+                return;
+            }
+            for frame in self.frames.drain(..) {
+                self.device.destroy_semaphore(frame.acquire_semaphore, None);
+                self.device.destroy_semaphore(frame.render_semaphore, None);
+                self.device.destroy_fence(frame.fence, None);
+            }
         }
     }
 }
@@ -432,16 +477,17 @@ impl Vulkan {
 impl Drop for Vulkan {
     fn drop(&mut self) {
         unsafe {
+            // Ensure all in-flight presentation/rendering has completed before
+            // destroying the swapchain or the device.
+            self.device.device_wait_idle().unwrap();
+
             if self.swapchain_khr != vk::SwapchainKHR::null() {
                 self.swapchain.destroy_swapchain(self.swapchain_khr, None);
             }
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);
             }
-            if self.acquire_semaphore != vk::Semaphore::null() {
-                self.device.destroy_semaphore(self.acquire_semaphore, None);
-                self.device.destroy_semaphore(self.render_semaphore, None);
-            }
+            self.destroy_frames();
             if self.command_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.command_pool, None);
             }
