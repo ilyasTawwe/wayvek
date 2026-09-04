@@ -545,6 +545,8 @@ struct DmaBuffer {
     memory: vk::DeviceMemory,
     fd: OwnedFd,
     planes: Vec<DmaPlane>,
+    /// Track when THIS specific buffer is safe to reuse.
+    last_release_point: Option<u64>,
 }
 
 /// A buffer handed to the Wayland layer to wrap in a wl_buffer, together with
@@ -581,8 +583,10 @@ struct Vulkan {
     extent: vk::Extent2D,
     command_pool: vk::CommandPool,
     frame: Option<FrameData>,
-    /// The current single buffer, recreated on resize.
-    buffer: Option<DmaBuffer>,
+    /// Double-buffered DMA buffers for the compositor.
+    buffers: [Option<DmaBuffer>; 2],
+    /// Which buffer slot we are currently using (0 or 1).
+    current_idx: usize,
     /// Chosen (drm fourcc, vk format, modifier), set once from the intersection.
     buffer_fmt: Option<(u32, vk::Format, u64)>,
 }
@@ -628,7 +632,8 @@ impl Vulkan {
                 extent: vk::Extent2D::default(),
                 command_pool: vk::CommandPool::null(),
                 frame: None,
-                buffer: None,
+                buffers: [None, None],
+                current_idx: 0,
                 buffer_fmt: None,
             })
         }
@@ -730,32 +735,39 @@ impl Vulkan {
     /// its exported dmabuf for the Wayland layer to wrap in a wl_buffer.
     fn present(&mut self, width: u32, height: u32) -> Result<PresentedBuffer, String> {
         unsafe {
-            // Recreate the buffer (and format/modifier choice) on first frame or
-            // when the size changes.
-            if self.buffer.is_none()
-                || self.extent.width != width
-                || self.extent.height != height
-            {
-                if self.buffer_fmt.is_none() {
-                    return Err("no DRM format chosen".to_string());
-                }
-                let (drm_format, vk_format, modifier) = self.buffer_fmt.unwrap();
-                self.create_buffer(width, height, drm_format, vk_format, modifier)?;
+            // 1. Handle Resize: Clear the pool if dimensions changed.
+            if self.extent.width != width || self.extent.height != height {
+                self.device.device_wait_idle().unwrap();
+                self.buffers = [None, None];
+                self.extent = vk::Extent2D { width, height };
             }
 
-            // Explicit sync is mandatory: we reuse the single buffer, so before
-            // re-clearing it we must wait until the compositor has signalled the
-            // previous frame's release point (wl_buffer.release is undefined
-            // while the syncobj surface extension is live).
-            let syncobj = self.syncobj.as_ref().expect("no DRM syncobj");
-            if let Some(wait_point) = syncobj.pending_release {
+            let (drm_format, vk_format, modifier) = self.buffer_fmt.ok_or("no DRM format")?;
+
+            // 2. Rotate buffers (Double Buffering).
+            self.current_idx = (self.current_idx + 1) % 2;
+
+            // 3. Lazily create the buffer for this slot.
+            if self.buffers[self.current_idx].is_none() {
+                self.buffers[self.current_idx] =
+                    Some(self.create_buffer(width, height, drm_format, vk_format, modifier)?);
+            }
+
+            let buf = self.buffers[self.current_idx].as_mut().unwrap();
+
+            // 4. THE FIX: Only wait if this specific buffer is currently being held
+            // by the compositor. Because we use two buffers, the compositor is
+            // usually done with 'buf' by the time we rotate back to it, so this
+            // wait returns immediately.
+            if let Some(wait_point) = buf.last_release_point {
+                let syncobj = self.syncobj.as_ref().expect("no DRM syncobj");
                 syncobj
                     .wait_release(wait_point, WAIT_RELEASE_TIMEOUT_NS)
-                    .map_err(|e| format!("wait for compositor release: {e}"))?;
+                    .map_err(|e| format!("Buffer reuse timeout: {e}"))?;
             }
 
             let frame = self.frame.as_mut().unwrap();
-            let image = self.buffer.as_ref().unwrap().image;
+            let image = buf.image;
             let command_buffer = frame.command_buffer;
 
             // Record a command buffer that clears the image to CLEAR_COLOR.
@@ -854,19 +866,22 @@ impl Vulkan {
                 .map_err(|e| format!("attach sync-file to timeline: {e}"))?;
             let release_point = acquire_point + 1;
 
+            // 5. Store the release point on the buffer so we know when it's
+            // safe to reuse next time.
+            buf.last_release_point = Some(release_point);
+
             // Hand the consumer a dup of the fd; the buffer keeps its own copy
             // for reuse on the next frame.
-            let buffer = self.buffer.as_ref().unwrap();
-            let dup_fd = buffer
+            let dup_fd = buf
                 .fd
                 .try_clone()
                 .map_err(|e| format!("dup dmabuf fd: {e}"))?;
 
             Ok(PresentedBuffer {
                 fd: dup_fd,
-                format_fourcc: self.drm_format,
-                modifier: self.modifier,
-                planes: buffer.planes.clone(),
+                format_fourcc: drm_format,
+                modifier,
+                planes: buf.planes.clone(),
                 width: width as i32,
                 height: height as i32,
                 acquire_point,
@@ -890,15 +905,8 @@ impl Vulkan {
         drm_format: u32,
         vk_format: vk::Format,
         modifier: u64,
-    ) -> Result<(), String> {
+    ) -> Result<DmaBuffer, String> {
         unsafe {
-            if let Some(old) = self.buffer.take() {
-                self.device.device_wait_idle().unwrap();
-                self.device.destroy_image(old.image, None);
-                self.device.free_memory(old.memory, None);
-                // old.fd closes on drop.
-            }
-
             let extent = vk::Extent2D {
                 width,
                 height,
@@ -975,12 +983,6 @@ impl Vulkan {
                 stride: layout.row_pitch,
             }];
 
-            self.buffer = Some(DmaBuffer {
-                image,
-                memory,
-                fd,
-                planes,
-            });
             self.vk_format = vk_format;
             self.drm_format = drm_format;
             self.modifier = modifier;
@@ -1021,7 +1023,13 @@ impl Vulkan {
                 });
             }
 
-            Ok(())
+            Ok(DmaBuffer {
+                image,
+                memory,
+                fd,
+                planes,
+                last_release_point: None,
+            })
         }
     }
 
@@ -1059,10 +1067,12 @@ impl Drop for Vulkan {
             self.device.device_wait_idle().unwrap();
 
             self.destroy_frame();
-            if let Some(buffer) = self.buffer.take() {
-                self.device.destroy_image(buffer.image, None);
-                self.device.free_memory(buffer.memory, None);
-                // buffer.fd closes on drop.
+            for slot in &mut self.buffers {
+                if let Some(buffer) = slot.take() {
+                    self.device.destroy_image(buffer.image, None);
+                    self.device.free_memory(buffer.memory, None);
+                    // buffer.fd closes on drop.
+                }
             }
             if self.command_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.command_pool, None);
