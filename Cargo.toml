@@ -3,6 +3,14 @@ name = "wayvek"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "wayvek"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wayvek"
+path = "src/main.rs"
+
 [dependencies]
 wayland-client = { version = "0.31.15", features = ["dlopen"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
