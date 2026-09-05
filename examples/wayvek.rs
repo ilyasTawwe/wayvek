@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use ash::vk;
 use wayland_client::Connection;
 
@@ -11,8 +12,8 @@ use wayvek::ExplicitSync;
 /// Window color as normalized floats (0.0-1.0) used as the render clear color.
 const CLEAR_COLOR: [f32; 4] = [0.18, 0.18, 0.64, 1.0];
 
-/// User-owned GPU resources for drawing the triangle. Built once on the first
-/// frame; independent of window size because viewport/scissor are dynamic.
+/// GPU resources for drawing the triangle. Built once; independent of window
+/// size because viewport/scissor are dynamic.
 struct TrianglePipeline {
     device: ash::Device,
     layout: vk::PipelineLayout,
@@ -46,39 +47,20 @@ fn load_spirv(bytes: &[u8]) -> Vec<u32> {
 
 /// Build a graphics pipeline that renders a full-screen-style triangle with a
 /// hardcoded vertex/color table (no vertex buffers or descriptor sets).
-fn create_triangle_pipeline(
-    device: &ash::Device,
-    format: vk::Format,
-) -> Result<TrianglePipeline, String> {
-    // SAFETY: all Vulkan handles created here are valid for `device`, the
-    // p_next chain is `#[repr(C)]`, and every error path cleans up after
-    // itself before returning.
+fn create_triangle_pipeline(device: &ash::Device, format: vk::Format) -> Result<TrianglePipeline> {
+    // SAFETY: all Vulkan handles created here are valid for `device` and the
+    // p_next chain is `#[repr(C)]`. Created handles are destroyed either by the
+    // returned struct's `Drop` or, on the `create_graphics_pipelines` error
+    // path, explicitly below.
     unsafe {
         let vert_code = load_spirv(include_bytes!("../shaders/triangle.vert.spv"));
         let frag_code = load_spirv(include_bytes!("../shaders/triangle.frag.spv"));
 
         let vert_module = device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_code), None)
-            .map_err(|e| format!("create vert shader module: {e}"))?;
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_code), None)?;
         let frag_module = device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_code), None)
-            .map_err(|e| format!("create frag shader module: {e}"))?;
-
-        // Release anything already created if a later step fails.
-        let cleanup = |vert: vk::ShaderModule, frag: vk::ShaderModule, layout: vk::PipelineLayout| {
-            device.destroy_shader_module(vert, None);
-            device.destroy_shader_module(frag, None);
-            if layout != vk::PipelineLayout::null() {
-                device.destroy_pipeline_layout(layout, None);
-            }
-        };
-
-        let layout = device
-            .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
-            .map_err(|e| {
-                cleanup(vert_module, frag_module, vk::PipelineLayout::null());
-                format!("create pipeline layout: {e}")
-            })?;
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_code), None)?;
+        let layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -135,17 +117,12 @@ fn create_triangle_pipeline(
             .push_next(&mut rendering);
 
         let pipelines = device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                std::slice::from_ref(&pipeline_info),
-                None,
-            )
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
             .map_err(|(partial, e)| {
                 for p in &partial {
                     device.destroy_pipeline(*p, None);
                 }
-                cleanup(vert_module, frag_module, layout);
-                format!("create graphics pipeline: {e}")
+                e
             })?;
 
         Ok(TrianglePipeline {
@@ -158,8 +135,8 @@ fn create_triangle_pipeline(
     }
 }
 
-fn main() {
-    let conn = Connection::connect_to_env().expect("failed to connect to Wayland display");
+fn main() -> Result<()> {
+    let conn = Connection::connect_to_env()?;
 
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
@@ -172,36 +149,28 @@ fn main() {
     {
         let display = conn.display();
         let _registry = display.get_registry(&qh, wayvek::backend::wayland::GlobalData);
-        event_queue
-            .roundtrip(&mut wayland)
-            .expect("failed to roundtrip while reading globals");
-        event_queue
-            .roundtrip(&mut wayland)
-            .expect("failed to roundtrip while reading dmabuf feedback");
+        event_queue.roundtrip(&mut wayland)?;
+        event_queue.roundtrip(&mut wayland)?;
     }
 
-    let main_device = wayland.main_device().expect("no main DRM device");
+    let main_device = wayland.main_device().ok_or_else(|| anyhow!("no main DRM device"))?;
     let advertised = wayland.advertised_formats();
 
     // Create the Vulkan renderer on the matching GPU.
-    let mut renderer = Vulkan::new(main_device).expect("vulkan init failed");
+    let mut renderer = Vulkan::new(main_device)?;
 
     // Negotiate a mutually supported format and modifier.
-    let (fourcc, modifier) =
-        negotiate(&advertised, |f| renderer.get_supported_modifiers(f))
-            .expect("no mutually supported DRM format");
+    let (fourcc, modifier) = negotiate(&advertised, |f| renderer.get_supported_modifiers(f))?;
     renderer.set_buffer_format(fourcc, modifier);
 
     eprintln!("chose format={fourcc} modifier={modifier:016x}");
 
     // Create the DRM syncobj timeline on the render node. main owns this
     // object and does the sync bridging per frame below.
-    let drm_fd = open_render_node(main_device).expect("failed to open render node");
-    let drm_sync = DrmSyncobj::create(drm_fd).expect("failed to create syncobj timeline");
+    let drm_sync = DrmSyncobj::create(open_render_node(main_device)?)?;
 
     // Import the syncobj timeline into the compositor once.
-    let timeline_fd = drm_sync.export_fd().expect("failed to export timeline fd");
-    wayland.import_timeline(&timeline_fd, &qh);
+    wayland.import_timeline(&drm_sync.export_fd()?, &qh);
 
     // Create the swapchain (double-buffered buffer slot allocator).
     let mut swapchain = Swapchain::new();
@@ -209,23 +178,22 @@ fn main() {
     // Create the window now that all globals are known.
     wayland.init_window(&qh);
 
-    // User-owned triangle pipeline, built lazily on the first frame.
-    let mut triangle: Option<TrianglePipeline> = None;
+    // Build the triangle pipeline once (the buffer format is set above).
+    let format = renderer.buffer_format().expect("buffer format configured");
+    let triangle = create_triangle_pipeline(&renderer.device(), format)?;
 
     // Blocking dispatch loop until the window is closed by the compositor.
     while wayland.running {
-        event_queue
-            .blocking_dispatch(&mut wayland)
-            .expect("error dispatching Wayland events");
+        event_queue.blocking_dispatch(&mut wayland)?;
 
         if let Some((w, h)) = wayland.pending_render.take() {
-            match (|| -> Result<(), String> {
+            match (|| -> Result<()> {
                 // 1. Acquire the next buffer slot (with backpressure).
                 let slot = swapchain.acquire(&drm_sync)?;
 
-                // 2. Draw into the buffer with the renderer.
+                // 2. Record the frame into the buffer.
                 let (frame, sync_file) =
-                    renderer.draw(slot, w, h, |_slot, device, cmd, image, view, format| {
+                    renderer.draw(slot, w, h, |_slot, device, cmd, image, view, _format| {
                         let subresource = vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .level_count(1)
@@ -251,15 +219,6 @@ fn main() {
                                 std::slice::from_ref(&to_attachment),
                             );
                         }
-
-                        // Lazily build the triangle pipeline on first use.
-                        if triangle.is_none() {
-                            triangle = Some(create_triangle_pipeline(&device, format)?);
-                        }
-                        let pipeline = triangle
-                            .as_ref()
-                            .expect("triangle built above")
-                            .pipeline;
 
                         let clear_value = vk::ClearValue {
                             color: vk::ClearColorValue { float32: CLEAR_COLOR },
@@ -299,7 +258,7 @@ fn main() {
                             device.cmd_bind_pipeline(
                                 cmd,
                                 vk::PipelineBindPoint::GRAPHICS,
-                                pipeline,
+                                triangle.pipeline,
                             );
                             device.cmd_draw(cmd, 3, 1, 0, 0);
                             device.cmd_end_rendering(cmd);
@@ -325,15 +284,11 @@ fn main() {
                                 std::slice::from_ref(&to_general),
                             );
                         }
-
-                        Ok(())
                     })?;
 
                 // 3. Sync bridging: import the completion sync-file into the
                 //    timeline, producing the acquire/release points.
-                let acquire_point = drm_sync
-                    .import_sync_file(&sync_file)
-                    .map_err(|e| format!("import sync-file: {e}"))?;
+                let acquire_point = drm_sync.import_sync_file(&sync_file)?;
                 let release_point = acquire_point + 1;
                 swapchain.mark_presented(slot, release_point);
 
@@ -348,8 +303,10 @@ fn main() {
                 Ok(())
             })() {
                 Ok(()) => {}
-                Err(e) => eprintln!("frame error: {e}"),
+                Err(e) => eprintln!("frame error: {e:#}"),
             }
         }
     }
+
+    Ok(())
 }

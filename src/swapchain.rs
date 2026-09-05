@@ -1,4 +1,5 @@
 use crate::drm::{DrmSyncobj, WAIT_RELEASE_TIMEOUT_NS};
+use crate::Result;
 
 /// The Swapchain is responsible only for the double-buffered DMA-BUF slots: it
 /// tracks which slot is current and records each slot's release point so it can
@@ -30,7 +31,7 @@ impl Swapchain {
     /// Acquire the next buffer slot. If the slot was previously presented it
     /// waits for the compositor to release it (via the caller-owned
     /// `drm_sync` timeline) before returning the slot index.
-    pub fn acquire(&mut self, drm_sync: &DrmSyncobj) -> Result<usize, String> {
+    pub fn acquire(&mut self, drm_sync: &DrmSyncobj) -> Result<usize> {
         // 1. Rotate buffer slot.
         self.current_idx = (self.current_idx + 1) % 2;
 
@@ -41,9 +42,7 @@ impl Swapchain {
         if self.presented[self.current_idx]
             && let Some(release_point) = self.release_points[self.current_idx]
         {
-            drm_sync
-                .wait_available(release_point, WAIT_RELEASE_TIMEOUT_NS)
-                .map_err(|e| format!("buffer reuse wait: {e}"))?;
+            drm_sync.wait_available(release_point, WAIT_RELEASE_TIMEOUT_NS)?;
         }
 
         Ok(self.current_idx)

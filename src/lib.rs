@@ -2,8 +2,11 @@ use std::os::unix::io::OwnedFd;
 
 pub mod backend;
 pub mod drm;
+pub mod error;
 pub mod renderer;
 pub mod swapchain;
+
+pub use error::{Result, WayvekError};
 
 /// DRM_FORMAT_MODIFIER_INVALID sentinel used in format negotiation.
 pub const DRM_FORMAT_MODIFIER_INVALID: u64 = (1u64 << 56) - 1;
@@ -58,14 +61,14 @@ pub struct ExplicitSync {
 pub fn negotiate(
     advertised: &[(u32, Vec<u64>)],
     vulkan_mods: impl Fn(u32) -> Vec<u64>,
-) -> Option<(u32, u64)> {
+) -> Result<(u32, u64)> {
     // First pass: prefer a non-linear, non-INVALID modifier.
     for &(fourcc, ref wl_mods) in advertised {
         let vk_mods = vulkan_mods(fourcc);
         for &modifier in wl_mods {
             if vk_mods.contains(&modifier) && modifier != 0 && modifier != DRM_FORMAT_MODIFIER_INVALID
             {
-                return Some((fourcc, modifier));
+                return Ok((fourcc, modifier));
             }
         }
     }
@@ -74,9 +77,9 @@ pub fn negotiate(
         let vk_mods = vulkan_mods(fourcc);
         for &modifier in wl_mods {
             if vk_mods.contains(&modifier) {
-                return Some((fourcc, modifier));
+                return Ok((fourcc, modifier));
             }
         }
     }
-    None
+    Err(WayvekError::NoNegotiatedFormat)
 }

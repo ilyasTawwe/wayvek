@@ -5,7 +5,7 @@ use ash::vk;
 use ash::{Entry, Instance};
 use drm_fourcc::DrmFourcc;
 
-use crate::{DmaFrame, DmaPlane};
+use crate::{DmaFrame, DmaPlane, Result, WayvekError};
 
 /// A frame's worth of GPU work: one command buffer (reused) and one fence.
 struct FrameData {
@@ -50,12 +50,12 @@ pub struct Vulkan {
 }
 
 impl Vulkan {
-    pub fn new(main_device: u64) -> Result<Self, String> {
+    pub fn new(main_device: u64) -> Result<Self> {
         // SAFETY: all ash entry points here require an initialized `Entry` and
         // `Instance`; `create_instance`/`create_device` return valid handles on
         // success, and the loaders are constructed from those valid handles.
         unsafe {
-            let entry = Entry::load().map_err(|e| e.to_string())?;
+            let entry = Entry::load()?;
             let instance = create_instance(&entry)?;
 
             let (physical_device, queue_family) =
@@ -118,15 +118,21 @@ impl Vulkan {
         self.buffer_fmt.map(|(_, vk_format, _)| vk_format)
     }
 
+    /// A handle to the underlying device, for the caller to create GPU
+    /// resources (pipelines, shader modules, buffers) before recording frames.
+    pub fn device(&self) -> ash::Device {
+        self.device.clone()
+    }
+
     /// Render a frame into the current DMA-backed buffer and return its
     /// exported DMA-BUF metadata and the GPU completion fence as a sync-file fd.
     ///
     /// The caller provides a `record` closure that receives the device,
     /// command buffer (already begun), the image handle (initially in
     /// `UNDEFINED` layout), its color-attachment image view, and the color
-    /// format, and records GPU commands (returning `Ok(())` on success).  The
-    /// renderer handles buffer creation, command-buffer begin/end, queue
-    /// submission, and fence export.
+    /// format, and records GPU commands.  The renderer handles buffer
+    /// creation, command-buffer begin/end, queue submission, and fence
+    /// export.
     ///
     /// This method is purely GPU-side: it has no knowledge of Wayland protocols
     /// or DRM syncobj timelines. The caller (Swapchain) is responsible for
@@ -143,22 +149,22 @@ impl Vulkan {
             vk::Image,
             vk::ImageView,
             vk::Format,
-        ) -> Result<(), String>,
-    ) -> Result<(DmaFrame, OwnedFd), String> {
+        ),
+    ) -> Result<(DmaFrame, OwnedFd)> {
         // SAFETY: this block invokes Vulkan command-buffer recording, queue
         // submission, and fd export. All Vulkan handles are valid (created in
-        // `new`/`create_buffer`); errors are propagated via `map_err(..)?`.
+        // `new`/`create_buffer`).
         unsafe {
             // 1. Handle Resize: Clear the pool if dimensions changed.
             if self.extent.width != width || self.extent.height != height {
-                self.device
-                    .device_wait_idle()
-                    .map_err(|e| format!("wait idle on resize: {e}"))?;
+                self.device.device_wait_idle()?;
                 self.buffers = [None, None];
                 self.extent = vk::Extent2D { width, height };
             }
 
-            let (drm_format, vk_format, modifier) = self.buffer_fmt.ok_or("no DRM format")?;
+            // The format was configured via set_buffer_format;
+            // buffer/command-buffer resources right below are lazily created.
+            let (drm_format, vk_format, modifier) = self.buffer_fmt.unwrap();
 
             // 2. Lazily create the buffer for this slot.
             if self.buffers[slot].is_none() {
@@ -166,14 +172,8 @@ impl Vulkan {
                     Some(self.create_buffer(width, height, vk_format, modifier)?);
             }
 
-            let buf = self.buffers[slot]
-                .as_ref()
-                .ok_or("buffer slot was not created")?;
-
-            let frame = self
-                .frame
-                .as_mut()
-                .ok_or("frame resources were not created")?;
+            let buf = self.buffers[slot].as_ref().unwrap();
+            let frame = self.frame.as_mut().unwrap();
             let image = buf.image;
             let command_buffer = frame.command_buffer;
 
@@ -185,48 +185,31 @@ impl Vulkan {
             // Begin command buffer and let the caller record GPU commands.
             let begin_info = vk::CommandBufferBeginInfo::default();
             self.device
-                .begin_command_buffer(command_buffer, &begin_info)
-                .map_err(|e| format!("begin command buffer: {e}"))?;
+                .begin_command_buffer(command_buffer, &begin_info)?;
 
-            record(
-                slot,
-                self.device.clone(),
-                command_buffer,
-                image,
-                buf.view,
-                vk_format,
-            )
-            .map_err(|e| format!("record commands: {e}"))?;
+            record(slot, self.device.clone(), command_buffer, image, buf.view, vk_format);
 
-            self.device
-                .end_command_buffer(command_buffer)
-                .map_err(|e| format!("end command buffer: {e}"))?;
+            self.device.end_command_buffer(command_buffer)?;
 
-            self.device
-                .reset_fences(std::slice::from_ref(&frame.fence))
-                .map_err(|e| format!("reset fence: {e}"))?;
+            self.device.reset_fences(std::slice::from_ref(&frame.fence))?;
 
             // Submit via the Vulkan 1.3 synchronization-2 entry point.
             let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
             let submit = vk::SubmitInfo2::default()
                 .command_buffer_infos(std::slice::from_ref(&cb_info));
             self.device
-                .queue_submit2(self.queue, std::slice::from_ref(&submit), frame.fence)
-                .map_err(|e| format!("queue submit2: {e}"))?;
+                .queue_submit2(self.queue, std::slice::from_ref(&submit), frame.fence)?;
 
             // Export the completion fence as a sync-file fd.
             let get_fence_fd = vk::FenceGetFdInfoKHR::default()
                 .fence(frame.fence)
                 .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-            let syncfd = self
-                .external_fence
-                .get_fence_fd(&get_fence_fd)
-                .map_err(|e| format!("export fence fd: {e}"))?;
+            let syncfd = self.external_fence.get_fence_fd(&get_fence_fd)?;
             let syncfd = OwnedFd::from_raw_fd(syncfd);
 
             // Build the DmaFrame from the buffer's metadata.
             let frame = DmaFrame {
-                fd: buf.fd.try_clone().map_err(|e| format!("dup dmabuf fd: {e}"))?,
+                fd: buf.fd.try_clone()?,
                 width,
                 height,
                 format: drm_format,
@@ -284,11 +267,11 @@ impl Vulkan {
         height: u32,
         vk_format: vk::Format,
         modifier: u64,
-    ) -> Result<DmaBuffer, String> {
+    ) -> Result<DmaBuffer> {
         // SAFETY: creates a DRM-format-modifier image, allocates exportable
         // device memory, binds them, exports a dmabuf fd, and composes the
-        // p_next chain. All Vulkan handles are valid, the allocator structs
-        // are `#[repr(C)]`, and errors are propagated via `map_err(..)?`.
+        // p_next chain. All Vulkan handles are valid and the allocator structs
+        // are `#[repr(C)]`.
         unsafe {
             let extent = vk::Extent2D { width, height };
             let modifier_list = [modifier];
@@ -318,15 +301,12 @@ impl Vulkan {
                 .push_next(&mut external)
                 .push_next(&mut drm_info);
 
-            let image = self
-                .device
-                .create_image(&create_info, None)
-                .map_err(|e| format!("create drm image: {e}"))?;
+            let image = self.device.create_image(&create_info, None)?;
 
             let memreq = self.device.get_image_memory_requirements(image);
             let memory_type_index = self
                 .pick_exportable_memory_type(memreq)
-                .ok_or("no exportable device-local memory type")?;
+                .ok_or(WayvekError::NoExportableMemoryType)?;
             let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
             let mut export_info = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -335,21 +315,13 @@ impl Vulkan {
                 .memory_type_index(memory_type_index)
                 .push_next(&mut dedicated)
                 .push_next(&mut export_info);
-            let memory = self
-                .device
-                .allocate_memory(&alloc, None)
-                .map_err(|e| format!("allocate external memory: {e}"))?;
-            self.device
-                .bind_image_memory(image, memory, 0)
-                .map_err(|e| format!("bind image memory: {e}"))?;
+            let memory = self.device.allocate_memory(&alloc, None)?;
+            self.device.bind_image_memory(image, memory, 0)?;
 
             let get_fd = vk::MemoryGetFdInfoKHR::default()
                 .memory(memory)
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let fd = self
-                .external_fd
-                .get_memory_fd(&get_fd)
-                .map_err(|e| format!("export dmabuf fd: {e}"))?;
+            let fd = self.external_fd.get_memory_fd(&get_fd)?;
             let fd = OwnedFd::from_raw_fd(fd);
 
             let subresource = vk::ImageSubresource::default()
@@ -372,10 +344,7 @@ impl Vulkan {
                         .level_count(1)
                         .layer_count(1),
                 );
-            let view = self
-                .device
-                .create_image_view(&view_info, None)
-                .map_err(|e| format!("create image view: {e}"))?;
+            let view = self.device.create_image_view(&view_info, None)?;
 
             self.extent = extent;
 
@@ -385,28 +354,19 @@ impl Vulkan {
                     let pool_info = vk::CommandPoolCreateInfo::default()
                         .queue_family_index(self.queue_family)
                         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-                    self.command_pool = self
-                        .device
-                        .create_command_pool(&pool_info, None)
-                        .map_err(|e| format!("create command pool: {e}"))?;
+                    self.command_pool = self.device.create_command_pool(&pool_info, None)?;
                 }
                 let alloc_info = vk::CommandBufferAllocateInfo::default()
                     .command_pool(self.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1);
-                let bufs = self
-                    .device
-                    .allocate_command_buffers(&alloc_info)
-                    .map_err(|e| format!("allocate command buffer: {e}"))?;
+                let bufs = self.device.allocate_command_buffers(&alloc_info)?;
                 let mut export_fence = vk::ExportFenceCreateInfo::default()
                     .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
                 let fence_info = vk::FenceCreateInfo::default()
                     .flags(vk::FenceCreateFlags::SIGNALED)
                     .push_next(&mut export_fence);
-                let fence = self
-                    .device
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| format!("create frame fence: {e}"))?;
+                let fence = self.device.create_fence(&fence_info, None)?;
                 self.frame = Some(FrameData {
                     command_buffer: bufs[0],
                     fence,
@@ -476,7 +436,7 @@ impl Drop for Vulkan {
 // Free helper functions
 // ---------------------------------------------------------------------------
 
-fn create_instance(entry: &Entry) -> Result<Instance, String> {
+fn create_instance(entry: &Entry) -> Result<Instance> {
     unsafe {
         let app_info = vk::ApplicationInfo::default()
             .api_version(vk::make_api_version(0, 1, 3, 0))
@@ -491,21 +451,17 @@ fn create_instance(entry: &Entry) -> Result<Instance, String> {
 
         // SAFETY: `app_info` and `create_info` are valid Vulkan descriptions
         // with internal pointers to `c"wayvek"` (which live for 'static).
-        entry
-            .create_instance(&create_info, None)
-            .map_err(|e| format!("create instance: {e}"))
+        Ok(entry.create_instance(&create_info, None)?)
     }
 }
 
 fn pick_physical_device(
     instance: &Instance,
     dev: u64,
-) -> Result<(vk::PhysicalDevice, u32), String> {
+) -> Result<(vk::PhysicalDevice, u32)> {
     let (major, minor) = (rustix::fs::major(dev), rustix::fs::minor(dev));
     unsafe {
-        let devices = instance
-            .enumerate_physical_devices()
-            .map_err(|e| format!("enumerate physical devices: {e}"))?;
+        let devices = instance.enumerate_physical_devices()?;
 
         for device in &devices {
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
@@ -538,7 +494,7 @@ fn pick_physical_device(
             }
         }
 
-        Err(format!("no Vulkan device matched main DRM {major}:{minor}"))
+        Err(WayvekError::NoMatchingDevice { major, minor })
     }
 }
 
@@ -546,7 +502,7 @@ fn create_device(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     queue_family: u32,
-) -> Result<ash::Device, String> {
+) -> Result<ash::Device> {
     // SAFETY: `create_device` is called with a valid `Instance` and
     // `PhysicalDevice`; extension names are `'static` ash constants.
     unsafe {
@@ -573,9 +529,7 @@ fn create_device(
             .push_next(&mut sync2_features)
             .push_next(&mut dynamic_rendering);
 
-        instance
-            .create_device(physical_device, &create_info, None)
-            .map_err(|e| format!("create device: {e}"))
+        Ok(instance.create_device(physical_device, &create_info, None)?)
     }
 }
 

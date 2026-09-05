@@ -7,10 +7,6 @@ edition = "2024"
 name = "wayvek"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wayvek"
-path = "src/main.rs"
-
 [dependencies]
 wayland-client = { version = "0.31.15", features = ["dlopen"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
@@ -18,3 +14,7 @@ ash = "0.38.0"
 drm-fourcc = "2.2.0"
 rustix = { version = "1", features = ["fs", "mm"] }
 zerocopy = { version = "0.8", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"

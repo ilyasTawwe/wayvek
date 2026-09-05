@@ -10,6 +10,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use rustix::fs::{major, minor};
 use rustix::ioctl::{self, opcode, Updater};
 
+use crate::Result;
+
 const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
 const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE: u32 = 1 << 1;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
@@ -104,7 +106,7 @@ pub struct DrmSyncobj {
 }
 
 impl DrmSyncobj {
-    pub fn create(fd: OwnedFd) -> std::io::Result<Self> {
+    pub fn create(fd: OwnedFd) -> Result<Self> {
         let mut create = DrmSyncobjCreate {
             handle: 0,
             flags: 0,
@@ -122,7 +124,7 @@ impl DrmSyncobj {
 
     /// Export an fd for `wp_linux_drm_syncobj_manager_v1.import_timeline`.
     /// The returned fd is a dup; the caller (or libwayland) owns it.
-    pub fn export_fd(&self) -> std::io::Result<OwnedFd> {
+    pub fn export_fd(&self) -> Result<OwnedFd> {
         let mut hand = DrmSyncobjHandle {
             handle: self.handle,
             flags: DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE,
@@ -138,7 +140,9 @@ impl DrmSyncobj {
             )?
         };
         if hand.fd < 0 {
-            return Err(std::io::Error::other("syncobj HANDLE_TO_FD gave no fd"));
+            return Err(crate::WayvekError::Io(std::io::Error::other(
+                "syncobj HANDLE_TO_FD returned no fd",
+            )));
         }
         // SAFETY: the kernel has allocated a fresh fd>=0; we take ownership.
         Ok(unsafe { OwnedFd::from_raw_fd(hand.fd) })
@@ -147,7 +151,7 @@ impl DrmSyncobj {
     /// Import a sync-file fd (the Vulkan fence) into a temporary syncobj and
     /// transfer its fence onto our timeline at the next point. Returns the
     /// acquire point for this commit.
-    pub fn import_sync_file(&self, syncfile_fd: &OwnedFd) -> std::io::Result<u64> {
+    pub fn import_sync_file(&self, syncfile_fd: &OwnedFd) -> Result<u64> {
         let acquire_point = self.next_point();
 
         // Create a throwaway binary syncobj to receive the imported sync-file.
@@ -157,8 +161,7 @@ impl DrmSyncobj {
         };
         // SAFETY: as `create()` above; fresh temp syncobj handle is written out.
         unsafe {
-            drm_ioctl_rw::<DrmSyncobjCreate, DRM_IOCTL_SYNCOBJ_CREATE_OP>(&self.fd, &mut create)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("create temp syncobj: {e}")))?
+            drm_ioctl_rw::<DrmSyncobjCreate, DRM_IOCTL_SYNCOBJ_CREATE_OP>(&self.fd, &mut create)?
         };
 
         // Import the sync-file into that existing temp syncobj.
@@ -174,13 +177,7 @@ impl DrmSyncobj {
             drm_ioctl_rw::<DrmSyncobjHandle, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE_OP>(
                 &self.fd,
                 &mut import,
-            )
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("import sync-file fd_to_handle: {e}"),
-                )
-            })?
+            )?
         };
         let temp = create.handle;
 
@@ -198,8 +195,7 @@ impl DrmSyncobj {
             drm_ioctl_rw::<DrmSyncobjTransfer, DRM_IOCTL_SYNCOBJ_TRANSFER_OP>(
                 &self.fd,
                 &mut transfer,
-            )
-            .map_err(|e| std::io::Error::new(e.kind(), format!("timeline transfer: {e}")))?
+            )?
         };
 
         // Best-effort cleanup of the temp handle after the transfer.
@@ -218,7 +214,7 @@ impl DrmSyncobj {
     /// Block until the compositor has signalled the given point, i.e. it no
     /// longer needs the buffer we handed it. Returns immediately if the point
     /// is already available.
-    pub fn wait_available(&self, point: u64, timeout_nsec: i64) -> std::io::Result<()> {
+    pub fn wait_available(&self, point: u64, timeout_nsec: i64) -> Result<()> {
         let mut handle = self.handle;
         let mut point_val = point;
         let mut wait = DrmSyncobjTimelineWait {
@@ -235,8 +231,9 @@ impl DrmSyncobj {
             drm_ioctl_rw::<DrmSyncobjTimelineWait, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_OP>(
                 &self.fd,
                 &mut wait,
-            )
+            )?;
         }
+        Ok(())
     }
 
     /// Return the next timeline point to use (current point + 1).
@@ -270,12 +267,12 @@ impl Drop for DrmSyncobj {
 
 /// Open the DRM render node `/dev/dri/renderD<minor>` for the given dev_t, so
 /// we can drive syncobj ioctls on the same GPU as the Vulkan device.
-pub fn open_render_node(dev: u64) -> std::io::Result<OwnedFd> {
+pub fn open_render_node(dev: u64) -> Result<OwnedFd> {
     let (_, minor) = (major(dev), minor(dev));
     rustix::fs::open(
         format!("/dev/dri/renderD{minor}"),
         rustix::fs::OFlags::RDWR,
         rustix::fs::Mode::empty(),
     )
-    .map_err(std::io::Error::from)
+    .map_err(Into::into)
 }
