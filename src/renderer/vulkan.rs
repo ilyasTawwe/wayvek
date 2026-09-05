@@ -17,6 +17,7 @@ struct FrameData {
 struct DmaBuffer {
     device: ash::Device,
     image: vk::Image,
+    view: vk::ImageView,
     memory: vk::DeviceMemory,
     fd: OwnedFd,
     planes: Vec<DmaPlane>,
@@ -26,6 +27,7 @@ impl Drop for DmaBuffer {
     fn drop(&mut self) {
         unsafe {
             self.device.free_memory(self.memory, None);
+            self.device.destroy_image_view(self.view, None);
             self.device.destroy_image(self.image, None);
         }
     }
@@ -111,14 +113,20 @@ impl Vulkan {
         self.buffer_fmt = Some((fourcc, vk_format, modifier));
     }
 
+    /// The Vulkan format of the buffer color attachment, if configured.
+    pub fn buffer_format(&self) -> Option<vk::Format> {
+        self.buffer_fmt.map(|(_, vk_format, _)| vk_format)
+    }
+
     /// Render a frame into the current DMA-backed buffer and return its
     /// exported DMA-BUF metadata and the GPU completion fence as a sync-file fd.
     ///
     /// The caller provides a `record` closure that receives the device,
-    /// command buffer (already begun), and image handle (initially in
-    /// `UNDEFINED` layout) and records GPU commands.  The renderer handles
-    /// buffer creation, command-buffer begin/end, queue submission, and
-    /// fence export.
+    /// command buffer (already begun), the image handle (initially in
+    /// `UNDEFINED` layout), its color-attachment image view, and the color
+    /// format, and records GPU commands (returning `Ok(())` on success).  The
+    /// renderer handles buffer creation, command-buffer begin/end, queue
+    /// submission, and fence export.
     ///
     /// This method is purely GPU-side: it has no knowledge of Wayland protocols
     /// or DRM syncobj timelines. The caller (Swapchain) is responsible for
@@ -128,7 +136,14 @@ impl Vulkan {
         slot: usize,
         width: u32,
         height: u32,
-        record: impl FnOnce(usize, ash::Device, vk::CommandBuffer, vk::Image),
+        record: impl FnOnce(
+            usize,
+            ash::Device,
+            vk::CommandBuffer,
+            vk::Image,
+            vk::ImageView,
+            vk::Format,
+        ) -> Result<(), String>,
     ) -> Result<(DmaFrame, OwnedFd), String> {
         // SAFETY: this block invokes Vulkan command-buffer recording, queue
         // submission, and fd export. All Vulkan handles are valid (created in
@@ -173,7 +188,15 @@ impl Vulkan {
                 .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| format!("begin command buffer: {e}"))?;
 
-            record(slot, self.device.clone(), command_buffer, image);
+            record(
+                slot,
+                self.device.clone(),
+                command_buffer,
+                image,
+                buf.view,
+                vk_format,
+            )
+            .map_err(|e| format!("record commands: {e}"))?;
 
             self.device
                 .end_command_buffer(command_buffer)
@@ -286,7 +309,10 @@ impl Vulkan {
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(vk::ImageUsageFlags::TRANSFER_DST)
+                .usage(
+                    vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut external)
@@ -336,6 +362,21 @@ impl Vulkan {
                 stride: layout.row_pitch,
             }];
 
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk_format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let view = self
+                .device
+                .create_image_view(&view_info, None)
+                .map_err(|e| format!("create image view: {e}"))?;
+
             self.extent = extent;
 
             // Set up the (single) frame command buffer + fence on first use.
@@ -375,6 +416,7 @@ impl Vulkan {
             Ok(DmaBuffer {
                 device: self.device.clone(),
                 image,
+                view,
                 memory,
                 fd,
                 planes,
@@ -522,11 +564,14 @@ fn create_device(
 
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default()
+            .dynamic_rendering(true);
 
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_extensions)
-            .push_next(&mut sync2_features);
+            .push_next(&mut sync2_features)
+            .push_next(&mut dynamic_rendering);
 
         instance
             .create_device(physical_device, &create_info, None)
